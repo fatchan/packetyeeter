@@ -15,6 +15,7 @@ import (
 
 	apiv1 "PacketYeeter/api/proto/v1"
 	"PacketYeeter/pkg/collector/ebpf"
+	"PacketYeeter/pkg/collector/haproxy"
 	"PacketYeeter/pkg/collector/haproxy/spoe"
 	"PacketYeeter/pkg/geoip"
 	"PacketYeeter/pkg/metrics"
@@ -98,6 +99,9 @@ type Collector struct {
 
 	// SPOE agent
 	spoeAgent *spoe.CollectorAgent
+
+	// HAProxy peer listener
+	haproxyPeerServer *haproxy.Server
 
 	// Metrics server
 	metricsServer *http.Server
@@ -236,6 +240,19 @@ func (c *Collector) Start(ctx context.Context) error {
 	// (policy blocks, rate-limit drops, bad-flags drops, etc.)
 	if err := c.startIncidentReader(); err != nil {
 		c.Logger.WithError(err).Warn("Failed to start incident event reader, structured incident logging will be unavailable")
+	}
+
+	if c.Config.HAProxyPort > 0 {
+		c.haproxyPeerServer = haproxy.NewServer(c.Config.HAProxyPort, c.Maps)
+		c.wg.Add(1)
+		go func() {
+			defer c.wg.Done()
+			if err := c.haproxyPeerServer.Start(); err != nil {
+				if c.ctx.Err() == nil {
+					c.Logger.WithError(err).Error("HAProxy peer listener error")
+				}
+			}
+		}()
 	}
 
 	// Start analyzer connection manager (handles reconnection)
@@ -397,7 +414,15 @@ func (c *Collector) checkAllowlist(ip net.IP) bool {
 // Stop stops the collector gracefully
 func (c *Collector) Stop() {
 	c.Logger.Info("Stopping collector...")
-	c.cancel()
+	if c.cancel != nil {
+		c.cancel()
+	}
+
+	if c.haproxyPeerServer != nil {
+		if err := c.haproxyPeerServer.Stop(); err != nil {
+			c.Logger.WithError(err).Warn("HAProxy peer listener shutdown error")
+		}
+	}
 
 	c.mu.Lock()
 	if c.signalStream != nil {

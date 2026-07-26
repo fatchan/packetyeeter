@@ -2,8 +2,10 @@ package haproxy
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net"
+	"sync"
 
 	"github.com/sirupsen/logrus"
 
@@ -23,6 +25,10 @@ type Blocker interface {
 type Server struct {
 	port    int
 	blocker Blocker
+
+	mu       sync.Mutex
+	listener net.Listener
+	stopOnce sync.Once
 }
 
 func NewServer(port int, blocker Blocker) *Server {
@@ -32,8 +38,23 @@ func NewServer(port int, blocker Blocker) *Server {
 	}
 }
 
-func (s *Server) Start() {
+func (s *Server) Start() error {
 	addr := fmt.Sprintf("127.0.0.1:%d", s.port)
+
+	s.mu.Lock()
+	if s.listener != nil {
+		s.mu.Unlock()
+		return fmt.Errorf("HAProxy peer listener already started")
+	}
+
+	ln, err := net.Listen("tcp", addr)
+	if err != nil {
+		s.mu.Unlock()
+		return fmt.Errorf("failed to listen for HAProxy peer protocol on %s: %w", addr, err)
+	}
+	s.listener = ln
+	s.mu.Unlock()
+
 	logrus.WithField("address", addr).Info("Starting HAProxy Peer Listener")
 
 	peer := peers.Peer{
@@ -43,9 +64,27 @@ func (s *Server) Start() {
 		},
 	}
 
-	if err := peer.ListenAndServe(); err != nil {
-		logrus.WithError(err).Error("Error running HAProxy Peer Listener")
+	if err := peer.Serve(ln); err != nil && !errors.Is(err, net.ErrClosed) {
+		return fmt.Errorf("HAProxy peer listener serve failed: %w", err)
 	}
+	return nil
+}
+
+func (s *Server) Stop() error {
+	var err error
+	s.stopOnce.Do(func() {
+		s.mu.Lock()
+		ln := s.listener
+		s.listener = nil
+		s.mu.Unlock()
+		if ln != nil {
+			err = ln.Close()
+		}
+	})
+	if err != nil && !errors.Is(err, net.ErrClosed) {
+		return err
+	}
+	return nil
 }
 
 type handler struct {
