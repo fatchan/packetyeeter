@@ -32,23 +32,25 @@ import (
 
 // Config holds collector configuration
 type Config struct {
-	Interface           string
-	AnalyzerAddr        string
-	MetricsAddr         string
-	SPOEAddr            string // e.g., ":9876"
-	HAProxyPort         int
-	SocketPath          string
-	GeoIPASNPath        string
-	AllowlistCIDRs      string // Comma-separated CIDRs
-	PolicyRules         string // Comma-separated CIDR=action rules (action = block|monitor)
-	BlockDuration       time.Duration
-	PollInterval        time.Duration // How often to poll eBPF maps and send to analyzer
-	SignalQueueSize     int           // Collector signal queue size (default 10000)
-	ICMPThreshold       uint32        // Kernel/XDP ICMP per-source PPS threshold (0 = BPF default)
-	UDPThreshold        uint32        // Kernel/XDP UDP per-source PPS threshold (0 = BPF default)
-	ICMPSignalThreshold float64       // Minimum ICMP PPS before sending a flood signal to analyzer
-	UDPSignalThreshold  float64       // Minimum UDP PPS before sending a flood signal to analyzer
-	DryRun              bool          // If true, the collector's own kernel-space detections (bad flags, SYN flood, ICMP/UDP rate limits) log/count but never drop traffic
+	Interface                string
+	AnalyzerAddr             string
+	MetricsAddr              string
+	SPOEAddr                 string // e.g., ":9876"
+	HAProxyPort              int
+	SocketPath               string
+	GeoIPASNPath             string
+	AllowlistCIDRs           string // Comma-separated CIDRs
+	PolicyRules              string // Comma-separated CIDR=action rules (action = block|monitor)
+	DynamicAllowlistHost     string // Host:port for dynamic allowlist source; empty disables runtime syncing
+	DynamicAllowlistInterval time.Duration
+	BlockDuration            time.Duration // Default block duration
+	PollInterval             time.Duration // How often to poll eBPF maps and send to analyzer
+	SignalQueueSize          int           // Collector signal queue size (default 10000)
+	ICMPThreshold            uint32        // Kernel/XDP ICMP per-source PPS threshold (0 = BPF default)
+	UDPThreshold             uint32        // Kernel/XDP UDP per-source PPS threshold (0 = BPF default)
+	ICMPSignalThreshold      float64       // Minimum ICMP PPS before sending a flood signal to analyzer
+	UDPSignalThreshold       float64       // Minimum UDP PPS before sending a flood signal to analyzer
+	DryRun                   bool          // If true, the collector's own kernel-space detections (bad flags, SYN flood, ICMP/UDP rate limits) log/count but never drop traffic
 }
 
 // Collector is a thin relay layer that:
@@ -65,14 +67,16 @@ type Collector struct {
 	Config Config
 
 	// Components
-	Loader         *ebpf.Loader
-	Maps           *ebpf.Maps
-	GeoIP          *geoip.Provider
-	Logger         *logrus.Logger
-	allowedNets    []*net.IPNet
-	policyRules    []ebpf.PolicyRule
-	perfReader     *perf.Reader
-	incidentReader *perf.Reader
+	Loader            *ebpf.Loader
+	Maps              *ebpf.Maps
+	GeoIP             *geoip.Provider
+	Logger            *logrus.Logger
+	allowedNets       []*net.IPNet
+	dynamicAllowedNets map[string]*net.IPNet
+	allowlistMu       sync.RWMutex
+	policyRules       []ebpf.PolicyRule
+	perfReader        *perf.Reader
+	incidentReader    *perf.Reader
 
 	// gRPC connection to analyzer
 	analyzerConn   *grpc.ClientConn
@@ -130,15 +134,16 @@ func max(a, b int) int {
 
 func New(cfg Config, logger *logrus.Logger) (*Collector, error) {
 	c := &Collector{
-		Config:             cfg,
-		Logger:             logger,
-		reconnectCh:        make(chan struct{}, 1),
-		signalQueue:        make(chan *apiv1.Signal, max(cfg.SignalQueueSize, 10000)), // Ring buffer default 10k
-		synCacheTTL:        60 * time.Second,                                          // TTL for SYN timestamp cache
-		prevICMPRates:      make(map[uint32]prevRate),
-		prevUDPRates:       make(map[uint32]prevRate),
-		prevBadFlagsSeen:   make(map[uint32]uint64),
-		prevBadFlagsSeenV6: make(map[[16]byte]uint64),
+		Config:              cfg,
+		Logger:              logger,
+		reconnectCh:         make(chan struct{}, 1),
+		signalQueue:         make(chan *apiv1.Signal, max(cfg.SignalQueueSize, 10000)), // Ring buffer default 10k
+		synCacheTTL:         60 * time.Second,                                          // TTL for SYN timestamp cache
+		prevICMPRates:       make(map[uint32]prevRate),
+		prevUDPRates:        make(map[uint32]prevRate),
+		prevBadFlagsSeen:    make(map[uint32]uint64),
+		prevBadFlagsSeenV6:  make(map[[16]byte]uint64),
+		dynamicAllowedNets:  make(map[string]*net.IPNet),
 	}
 
 	// Load GeoIP database
@@ -269,6 +274,15 @@ func (c *Collector) Start(ctx context.Context) error {
 				}
 			}
 		}()
+	}
+
+	if c.Config.DynamicAllowlistHost != "" {
+		c.Logger.WithFields(logrus.Fields{
+			"host":     c.Config.DynamicAllowlistHost,
+			"interval": c.Config.DynamicAllowlistInterval,
+		}).Info("Dynamic allowlist syncing enabled")
+		c.wg.Add(1)
+		go c.runDynamicAllowlistSync()
 	}
 
 	// Start analyzer connection manager (handles reconnection)
@@ -424,6 +438,9 @@ func (c *Collector) checkAllowlist(ip net.IP) bool {
 	if ip.IsLoopback() {
 		return true
 	}
+
+	c.allowlistMu.RLock()
+	defer c.allowlistMu.RUnlock()
 	for _, subnet := range c.allowedNets {
 		if subnet.Contains(ip) {
 			return true
@@ -556,7 +573,9 @@ func (c *Collector) executeCommand(cmd *apiv1.Command) {
 		} else {
 			ipNet = &net.IPNet{IP: ip, Mask: net.CIDRMask(128, 128)}
 		}
+		c.allowlistMu.Lock()
 		c.allowedNets = append(c.allowedNets, ipNet)
+		c.allowlistMu.Unlock()
 		if err := c.Maps.AddAllowlistEntry(ipNet); err != nil {
 			logger.WithError(err).Warn("Failed to add IP to kernel-space allowlist")
 		}
@@ -564,6 +583,7 @@ func (c *Collector) executeCommand(cmd *apiv1.Command) {
 
 	case apiv1.CommandType_COMMAND_REMOVE_ALLOWLIST_IP:
 		// Remove IP from allowlist
+		c.allowlistMu.Lock()
 		filtered := make([]*net.IPNet, 0, len(c.allowedNets))
 		for _, n := range c.allowedNets {
 			if !n.IP.Equal(ip) {
@@ -575,6 +595,8 @@ func (c *Collector) executeCommand(cmd *apiv1.Command) {
 			}
 		}
 		c.allowedNets = filtered
+		delete(c.dynamicAllowedNets, normalizeIPNet(ipNetFromIP(ip)))
+		c.allowlistMu.Unlock()
 		logger.Info("Removed IP from allowlist by analyzer command")
 
 	default:
@@ -1264,6 +1286,16 @@ func effectiveSignalThreshold(v float64) float64 {
 		return 1000.0
 	}
 	return v
+}
+
+func ipNetFromIP(ip net.IP) *net.IPNet {
+	if ip == nil {
+		return nil
+	}
+	if ip4 := ip.To4(); ip4 != nil {
+		return &net.IPNet{IP: ip4, Mask: net.CIDRMask(32, 32)}
+	}
+	return &net.IPNet{IP: ip, Mask: net.CIDRMask(128, 128)}
 }
 
 // runBlockGC garbage collects expired blocks from eBPF maps
