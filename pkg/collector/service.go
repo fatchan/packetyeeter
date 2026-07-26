@@ -41,8 +41,10 @@ type Config struct {
 	GeoIPASNPath             string
 	AllowlistCIDRs           string // Comma-separated CIDRs
 	PolicyRules              string // Comma-separated CIDR=action rules (action = block|monitor)
-	DynamicAllowlistHost     string // Host:port for dynamic allowlist source; empty disables runtime syncing
+	DynamicAllowlistSocketPath string // Path to HAProxy runtime Unix socket for dynamic allowlist syncing; empty disables runtime syncing
 	DynamicAllowlistInterval time.Duration
+	HAProxyWhitelistMapPath  string        // Path to HAProxy whitelist map containing incoming IPs that should always be allowed
+	HAProxyBackendsMapPath   string        // Path to HAProxy backends map containing backend hosts that should always be allowed
 	BlockDuration            time.Duration // Default block duration
 	PollInterval             time.Duration // How often to poll eBPF maps and send to analyzer
 	SignalQueueSize          int           // Collector signal queue size (default 10000)
@@ -67,16 +69,16 @@ type Collector struct {
 	Config Config
 
 	// Components
-	Loader            *ebpf.Loader
-	Maps              *ebpf.Maps
-	GeoIP             *geoip.Provider
-	Logger            *logrus.Logger
-	allowedNets       []*net.IPNet
+	Loader             *ebpf.Loader
+	Maps               *ebpf.Maps
+	GeoIP              *geoip.Provider
+	Logger             *logrus.Logger
+	allowedNets        []*net.IPNet
 	dynamicAllowedNets map[string]*net.IPNet
-	allowlistMu       sync.RWMutex
-	policyRules       []ebpf.PolicyRule
-	perfReader        *perf.Reader
-	incidentReader    *perf.Reader
+	allowlistMu        sync.RWMutex
+	policyRules        []ebpf.PolicyRule
+	perfReader         *perf.Reader
+	incidentReader     *perf.Reader
 
 	// gRPC connection to analyzer
 	analyzerConn   *grpc.ClientConn
@@ -134,16 +136,16 @@ func max(a, b int) int {
 
 func New(cfg Config, logger *logrus.Logger) (*Collector, error) {
 	c := &Collector{
-		Config:              cfg,
-		Logger:              logger,
-		reconnectCh:         make(chan struct{}, 1),
-		signalQueue:         make(chan *apiv1.Signal, max(cfg.SignalQueueSize, 10000)), // Ring buffer default 10k
-		synCacheTTL:         60 * time.Second,                                          // TTL for SYN timestamp cache
-		prevICMPRates:       make(map[uint32]prevRate),
-		prevUDPRates:        make(map[uint32]prevRate),
-		prevBadFlagsSeen:    make(map[uint32]uint64),
-		prevBadFlagsSeenV6:  make(map[[16]byte]uint64),
-		dynamicAllowedNets:  make(map[string]*net.IPNet),
+		Config:             cfg,
+		Logger:             logger,
+		reconnectCh:        make(chan struct{}, 1),
+		signalQueue:        make(chan *apiv1.Signal, max(cfg.SignalQueueSize, 10000)), // Ring buffer default 10k
+		synCacheTTL:        60 * time.Second,                                          // TTL for SYN timestamp cache
+		prevICMPRates:      make(map[uint32]prevRate),
+		prevUDPRates:       make(map[uint32]prevRate),
+		prevBadFlagsSeen:   make(map[uint32]uint64),
+		prevBadFlagsSeenV6: make(map[[16]byte]uint64),
+		dynamicAllowedNets: make(map[string]*net.IPNet),
 	}
 
 	// Load GeoIP database
@@ -276,10 +278,12 @@ func (c *Collector) Start(ctx context.Context) error {
 		}()
 	}
 
-	if c.Config.DynamicAllowlistHost != "" {
+	if c.Config.DynamicAllowlistSocketPath != "" {
 		c.Logger.WithFields(logrus.Fields{
-			"host":     c.Config.DynamicAllowlistHost,
-			"interval": c.Config.DynamicAllowlistInterval,
+			"socket_path":        c.Config.DynamicAllowlistSocketPath,
+			"interval":           c.Config.DynamicAllowlistInterval,
+			"whitelist_map_path": c.Config.HAProxyWhitelistMapPath,
+			"backends_map_path":  c.Config.HAProxyBackendsMapPath,
 		}).Info("Dynamic allowlist syncing enabled")
 		c.wg.Add(1)
 		go c.runDynamicAllowlistSync()

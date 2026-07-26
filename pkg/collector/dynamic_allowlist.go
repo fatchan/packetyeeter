@@ -1,26 +1,103 @@
 package collector
 
 import (
+	"context"
+	"encoding/json"
 	"fmt"
 	"net"
 	"sort"
 	"strings"
 	"time"
 
+	runtimeapi "github.com/haproxytech/client-native/v6/runtime"
+	runtimeopts "github.com/haproxytech/client-native/v6/runtime/options"
 	"github.com/sirupsen/logrus"
 )
 
+type haproxyBackendTarget struct {
+	H string `json:"h"`
+}
+
 // FetchDynamicAllowlist returns the desired runtime allowlist entries.
 //
-// Replace this implementation with whatever external source you want to use.
-// Entries may be plain IPs or CIDRs. Plain IPs are normalized to /32 or /128.
-func FetchDynamicAllowlist(host string) ([]string, error) {
-	_ = host
-	return []string{}, nil
+// It reads the HAProxy runtime whitelist map and backend map, returning:
+//   - whitelist map keys directly
+//   - backend target host IPs extracted from JSON value[].h (host:port)
+func FetchDynamicAllowlist(socketPath, whitelistMapPath, backendsMapPath string) ([]string, error) {
+	sockets := runtimeopts.Sockets(map[int]string{1: socketPath})
+	rt, err := runtimeapi.New(context.Background(), sockets, runtimeopts.MapsDir("/etc/haproxy/map"))
+	if err != nil {
+		return nil, fmt.Errorf("create HAProxy runtime client: %w", err)
+	}
+
+	var out []string
+
+	if whitelistMapPath != "" {
+		entries, err := rt.ShowMapEntries(whitelistMapPath)
+		if err != nil {
+			return nil, fmt.Errorf("read whitelist map %q: %w", whitelistMapPath, err)
+		}
+		for _, entry := range entries {
+			if entry == nil {
+				continue
+			}
+			key := strings.TrimSpace(entry.Key)
+			if key == "" {
+				continue
+			}
+			out = append(out, key)
+		}
+	}
+
+	if backendsMapPath != "" {
+		entries, err := rt.ShowMapEntries(backendsMapPath)
+		if err != nil {
+			return nil, fmt.Errorf("read backends map %q: %w", backendsMapPath, err)
+		}
+		for _, entry := range entries {
+			if entry == nil {
+				continue
+			}
+			value := strings.TrimSpace(entry.Value)
+			if value == "" {
+				continue
+			}
+
+			var targets []haproxyBackendTarget
+			if err := json.Unmarshal([]byte(value), &targets); err != nil {
+				continue
+			}
+
+			for _, target := range targets {
+				h := strings.TrimSpace(target.H)
+				if h == "" {
+					continue
+				}
+
+				hostPart, _, err := net.SplitHostPort(h)
+				if err != nil {
+					if idx := strings.LastIndex(h, ":"); idx > 0 {
+						hostPart = h[:idx]
+					} else {
+						hostPart = h
+					}
+				}
+
+				hostPart = strings.TrimSpace(strings.Trim(hostPart, "[]"))
+				if hostPart == "" {
+					continue
+				}
+
+				out = append(out, hostPart)
+			}
+		}
+	}
+
+	return out, nil
 }
 
 func (c *Collector) syncDynamicAllowlist() {
-	entries, err := FetchDynamicAllowlist(c.Config.DynamicAllowlistHost)
+	entries, err := FetchDynamicAllowlist(c.Config.DynamicAllowlistSocketPath, c.Config.HAProxyWhitelistMapPath, c.Config.HAProxyBackendsMapPath)
 	if err != nil {
 		c.Logger.WithError(err).Warn("Failed to fetch dynamic allowlist")
 		return
@@ -59,12 +136,16 @@ func (c *Collector) syncDynamicAllowlist() {
 	}
 
 	c.Logger.WithFields(logrus.Fields{
-		"host":    c.Config.DynamicAllowlistHost,
-		"desired": len(desiredByKey),
-		"added":   added,
-		"removed": removed,
-		"invalid": invalidCount,
-	}).Debug("Dynamic allowlist sync complete")
+		"socket_path":                 c.Config.DynamicAllowlistSocketPath,
+		"whitelist_map_path":          c.Config.HAProxyWhitelistMapPath,
+		"backends_map_path":           c.Config.HAProxyBackendsMapPath,
+		"fetched_entries":             len(entries),
+		"desired_allowlist_entries":   len(desiredByKey),
+		"current_dynamic_allowlisted": len(c.snapshotDynamicAllowlist()),
+		"added":                       added,
+		"removed":                     removed,
+		"invalid":                     invalidCount,
+	}).Info("Dynamic allowlist sync complete")
 }
 
 func (c *Collector) runDynamicAllowlistSync() {
@@ -148,6 +229,15 @@ func normalizeIPNet(n *net.IPNet) string {
 		return ""
 	}
 	return n.String()
+}
+
+func sortAllowlistEntries(entries []allowlistEntry) {
+	sort.Slice(entries, func(i, j int) bool {
+		if entries[i].Dynamic == entries[j].Dynamic {
+			return entries[i].CIDR < entries[j].CIDR
+		}
+		return !entries[i].Dynamic && entries[j].Dynamic
+	})
 }
 
 func (c *Collector) snapshotDynamicAllowlist() []*net.IPNet {
