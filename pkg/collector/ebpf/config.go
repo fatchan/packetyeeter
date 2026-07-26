@@ -1,9 +1,23 @@
 package ebpf
 
-// configKeyMonitorMode is the config_map array index checked by the XDP
-// program (as `key_monitor = 1` in protector.bpf.c) before every enforcement
-// drop (bad flags, SYN-flood blocklist, ICMP/UDP rate limits, allowlist).
-const configKeyMonitorMode uint32 = 1
+const (
+	// configKeyICMPThreshold is the config_map array index checked by the XDP
+	// program (as `key_icmp_limit = 0` in protector.bpf.c) for IPv4 and IPv6
+	// ICMP rate limiting. A value of 0 means "leave unset and let BPF use its
+	// built-in fallback default".
+	configKeyICMPThreshold uint32 = 0
+
+	// configKeyMonitorMode is the config_map array index checked by the XDP
+	// program (as `key_monitor = 1` in protector.bpf.c) before every enforcement
+	// drop (bad flags, SYN-flood blocklist, ICMP/UDP rate limits, allowlist).
+	configKeyMonitorMode uint32 = 1
+
+	// configKeyUDPThreshold is the config_map array index checked by the XDP
+	// program (as `key_udp_limit = 2` in protector.bpf.c) for IPv4 and IPv6 UDP
+	// rate limiting. A value of 0 means "leave unset and let BPF use its built-in
+	// fallback default".
+	configKeyUDPThreshold uint32 = 2
+)
 
 // SetMonitorMode toggles the collector's kernel-space dry-run/monitor mode.
 // When enabled is true, the XDP program's `is_monitor` check causes every
@@ -27,4 +41,26 @@ func (m *Maps) SetMonitorMode(enabled bool) error {
 	}
 
 	return m.ConfigMap.Put(configKeyMonitorMode, value)
+}
+
+// SetICMPThreshold writes the kernel/XDP ICMP per-source PPS threshold into
+// config_map for both IPv4 and IPv6 enforcement paths. A value of 0 is treated
+// as "use the BPF program's built-in fallback default" and intentionally does
+// not write anything.
+func (m *Maps) SetICMPThreshold(limit uint32) error {
+	if m.ConfigMap == nil || limit == 0 {
+		return nil
+	}
+	return m.ConfigMap.Put(configKeyICMPThreshold, limit)
+}
+
+// SetUDPThreshold writes the kernel/XDP UDP per-source PPS threshold into
+// config_map for both IPv4 and IPv6 enforcement paths. A value of 0 is treated
+// as "use the BPF program's built-in fallback default" and intentionally does
+// not write anything.
+func (m *Maps) SetUDPThreshold(limit uint32) error {
+	if m.ConfigMap == nil || limit == 0 {
+		return nil
+	}
+	return m.ConfigMap.Put(configKeyUDPThreshold, limit)
 }

@@ -32,19 +32,23 @@ import (
 
 // Config holds collector configuration
 type Config struct {
-	Interface       string
-	AnalyzerAddr    string
-	MetricsAddr     string
-	SPOEAddr        string // e.g., ":9876"
-	HAProxyPort     int
-	SocketPath      string
-	GeoIPASNPath    string
-	AllowlistCIDRs  string // Comma-separated CIDRs
-	PolicyRules     string // Comma-separated CIDR=action rules (action = block|monitor)
-	BlockDuration   time.Duration
-	PollInterval    time.Duration // How often to poll eBPF maps and send to analyzer
-	SignalQueueSize int           // Collector signal queue size (default 10000)
-	DryRun          bool          // If true, the collector's own kernel-space detections (bad flags, SYN flood, ICMP/UDP rate limits) log/count but never drop traffic
+	Interface           string
+	AnalyzerAddr        string
+	MetricsAddr         string
+	SPOEAddr            string // e.g., ":9876"
+	HAProxyPort         int
+	SocketPath          string
+	GeoIPASNPath        string
+	AllowlistCIDRs      string // Comma-separated CIDRs
+	PolicyRules         string // Comma-separated CIDR=action rules (action = block|monitor)
+	BlockDuration       time.Duration
+	PollInterval        time.Duration // How often to poll eBPF maps and send to analyzer
+	SignalQueueSize     int           // Collector signal queue size (default 10000)
+	ICMPThreshold       uint32        // Kernel/XDP ICMP per-source PPS threshold (0 = BPF default)
+	UDPThreshold        uint32        // Kernel/XDP UDP per-source PPS threshold (0 = BPF default)
+	ICMPSignalThreshold float64       // Minimum ICMP PPS before sending a flood signal to analyzer
+	UDPSignalThreshold  float64       // Minimum UDP PPS before sending a flood signal to analyzer
+	DryRun              bool          // If true, the collector's own kernel-space detections (bad flags, SYN flood, ICMP/UDP rate limits) log/count but never drop traffic
 }
 
 // Collector is a thin relay layer that:
@@ -194,6 +198,18 @@ func (c *Collector) Start(ctx context.Context) error {
 	c.Maps = c.Loader.GetMaps()
 	c.Logger.Info("eBPF programs loaded and attached")
 
+	if err := c.Maps.SetICMPThreshold(c.Config.ICMPThreshold); err != nil {
+		c.Logger.WithError(err).Warn("Failed to configure kernel/XDP ICMP threshold; BPF default may still apply")
+	} else if c.Config.ICMPThreshold > 0 {
+		c.Logger.WithField("threshold_pps", c.Config.ICMPThreshold).Info("Configured kernel/XDP ICMP threshold")
+	}
+
+	if err := c.Maps.SetUDPThreshold(c.Config.UDPThreshold); err != nil {
+		c.Logger.WithError(err).Warn("Failed to configure kernel/XDP UDP threshold; BPF default may still apply")
+	} else if c.Config.UDPThreshold > 0 {
+		c.Logger.WithField("threshold_pps", c.Config.UDPThreshold).Info("Configured kernel/XDP UDP threshold")
+	}
+
 	// Enable kernel-space monitor/dry-run mode if requested. This is
 	// independent of the analyzer's own -dry-run flag: it governs whether
 	// the collector's own kernel-level detections (bad flags, SYN-flood
@@ -305,6 +321,11 @@ func (c *Collector) Start(ctx context.Context) error {
 			c.Logger.WithError(err).Error("Metrics server error")
 		}
 	}()
+
+	c.Logger.WithFields(logrus.Fields{
+		"icmp_signal_threshold_pps": effectiveSignalThreshold(c.Config.ICMPSignalThreshold),
+		"udp_signal_threshold_pps":  effectiveSignalThreshold(c.Config.UDPSignalThreshold),
+	}).Info("Configured userspace flood-signal thresholds")
 
 	c.Logger.Info("Collector started")
 	return nil
@@ -976,8 +997,8 @@ func (c *Collector) sendICMPRates() {
 		return
 	}
 
-	const maxBatchSize = 1000  // Limit signals per poll
-	const minFloodPPS = 1000.0 // Raised to 1000 - avoid false positives on legitimate bursts
+	const maxBatchSize = 1000 // Limit signals per poll
+	minFloodPPS := effectiveSignalThreshold(c.Config.ICMPSignalThreshold)
 	sentCount := 0
 	totalPPS := 0.0
 
@@ -1049,8 +1070,8 @@ func (c *Collector) sendUDPRates() {
 		return
 	}
 
-	const maxBatchSize = 1000  // Limit signals per poll
-	const minFloodPPS = 1000.0 // Raised to 1000 - avoid false positives on legitimate bursts
+	const maxBatchSize = 1000 // Limit signals per poll
+	minFloodPPS := effectiveSignalThreshold(c.Config.UDPSignalThreshold)
 	sentCount := 0
 	totalPPS := 0.0
 
@@ -1236,6 +1257,13 @@ func computePPS(prev map[uint32]prevRate, ip uint32, rate ebpf.ICMPRate) float64
 		return float64(pr.count)
 	}
 	return float64(rate.Count)
+}
+
+func effectiveSignalThreshold(v float64) float64 {
+	if v <= 0 {
+		return 1000.0
+	}
+	return v
 }
 
 // runBlockGC garbage collects expired blocks from eBPF maps
