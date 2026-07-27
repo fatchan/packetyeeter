@@ -32,27 +32,27 @@ import (
 
 // Config holds collector configuration
 type Config struct {
-	Interface                string
-	AnalyzerAddr             string
-	MetricsAddr              string
-	SPOEAddr                 string // e.g., ":9876"
-	HAProxyPort              int
-	SocketPath               string
-	GeoIPASNPath             string
-	AllowlistCIDRs           string // Comma-separated CIDRs
-	PolicyRules              string // Comma-separated CIDR=action rules (action = block|monitor)
+	Interface                  string
+	AnalyzerAddr               string
+	MetricsAddr                string
+	SPOEAddr                   string // e.g., ":9876"
+	HAProxyPort                int
+	SocketPath                 string
+	GeoIPASNPath               string
+	AllowlistCIDRs             string // Comma-separated CIDRs
+	PolicyRules                string // Comma-separated CIDR=action rules (action = block|monitor)
 	DynamicAllowlistSocketPath string // Path to HAProxy runtime Unix socket for dynamic allowlist syncing; empty disables runtime syncing
-	DynamicAllowlistInterval time.Duration
-	HAProxyWhitelistMapPath  string        // Path to HAProxy whitelist map containing incoming IPs that should always be allowed
-	HAProxyBackendsMapPath   string        // Path to HAProxy backends map containing backend hosts that should always be allowed
-	BlockDuration            time.Duration // Default block duration
-	PollInterval             time.Duration // How often to poll eBPF maps and send to analyzer
-	SignalQueueSize          int           // Collector signal queue size (default 10000)
-	ICMPThreshold            uint32        // Kernel/XDP ICMP per-source PPS threshold (0 = BPF default)
-	UDPThreshold             uint32        // Kernel/XDP UDP per-source PPS threshold (0 = BPF default)
-	ICMPSignalThreshold      float64       // Minimum ICMP PPS before sending a flood signal to analyzer
-	UDPSignalThreshold       float64       // Minimum UDP PPS before sending a flood signal to analyzer
-	DryRun                   bool          // If true, the collector's own kernel-space detections (bad flags, SYN flood, ICMP/UDP rate limits) log/count but never drop traffic
+	DynamicAllowlistInterval   time.Duration
+	HAProxyWhitelistMapPath    string        // Path to HAProxy whitelist map containing incoming IPs that should always be allowed
+	HAProxyBackendsMapPath     string        // Path to HAProxy backends map containing backend hosts that should always be allowed
+	BlockDuration              time.Duration // Default block duration
+	PollInterval               time.Duration // How often to poll eBPF maps and send to analyzer
+	SignalQueueSize            int           // Collector signal queue size (default 10000)
+	ICMPThreshold              uint32        // Kernel/XDP ICMP per-source PPS threshold (0 = BPF default)
+	UDPThreshold               uint32        // Kernel/XDP UDP per-source PPS threshold (0 = BPF default)
+	ICMPSignalThreshold        float64       // Minimum ICMP PPS before sending a flood signal to analyzer
+	UDPSignalThreshold         float64       // Minimum UDP PPS before sending a flood signal to analyzer
+	DryRun                     bool          // If true, the collector's own kernel-space detections (bad flags, SYN flood, ICMP/UDP rate limits) log/count but never drop traffic
 }
 
 // Collector is a thin relay layer that:
@@ -63,6 +63,11 @@ type Config struct {
 type prevRate struct {
 	lastTime uint64
 	count    uint64
+}
+
+type incidentLogThrottleState struct {
+	lastLog    time.Time
+	suppressed uint64
 }
 
 type Collector struct {
@@ -107,6 +112,11 @@ type Collector struct {
 	synCache    sync.Map // IP string -> time.Time
 	synCacheTTL time.Duration
 
+	// Aggregate high-volume incident logs by reason to keep logging cheap
+	// while preserving exact Prometheus counters.
+	incidentLogMu    sync.Mutex
+	incidentLogState map[string]*incidentLogThrottleState
+
 	// SPOE agent
 	spoeAgent *spoe.CollectorAgent
 
@@ -146,6 +156,7 @@ func New(cfg Config, logger *logrus.Logger) (*Collector, error) {
 		prevBadFlagsSeen:   make(map[uint32]uint64),
 		prevBadFlagsSeenV6: make(map[[16]byte]uint64),
 		dynamicAllowedNets: make(map[string]*net.IPNet),
+		incidentLogState:   make(map[string]*incidentLogThrottleState),
 	}
 
 	// Load GeoIP database
@@ -792,6 +803,40 @@ func (c *Collector) readIncidentEvents() {
 	}
 }
 
+const incidentLogThrottleInterval = 5 * time.Second
+
+// logIncidentThrottled keeps exact metrics but rate-limits warning logs.
+// Logs are aggregated by reason so cardinality stays bounded during attacks.
+func (c *Collector) logIncidentThrottled(ip net.IP, reason string, kernelTimestamp uint64) {
+	key := reason
+	now := time.Now()
+
+	c.incidentLogMu.Lock()
+	state, ok := c.incidentLogState[key]
+	if !ok {
+		state = &incidentLogThrottleState{}
+		c.incidentLogState[key] = state
+	}
+
+	if state.lastLog.IsZero() || now.Sub(state.lastLog) >= incidentLogThrottleInterval {
+		suppressed := state.suppressed
+		state.lastLog = now
+		state.suppressed = 0
+		c.incidentLogMu.Unlock()
+
+		c.Logger.WithFields(logrus.Fields{
+			"ip":               ip.String(),
+			"reason":           reason,
+			"kernel_timestamp": kernelTimestamp,
+			"suppressed_count": suppressed,
+		}).Warn("Kernel-space enforcement incident")
+		return
+	}
+
+	state.suppressed++
+	c.incidentLogMu.Unlock()
+}
+
 // processIncidentEvent decodes a single structured incident event and logs
 // it. This is purely a local audit-trail/metrics feature: it does not
 // generate an analyzer signal, since the underlying drop conditions
@@ -816,11 +861,7 @@ func (c *Collector) processIncidentEvent(data []byte) {
 	reason := ebpf.IncidentReasonName(inc.Reason)
 	metrics.KernelIncidents.WithLabelValues(reason).Inc()
 
-	c.Logger.WithFields(logrus.Fields{
-		"ip":               ip.String(),
-		"reason":           reason,
-		"kernel_timestamp": inc.Timestamp,
-	}).Warn("Kernel-space enforcement incident")
+	c.logIncidentThrottled(ip, reason, inc.Timestamp)
 }
 
 func (c *Collector) storeSynTimestamp(ip net.IP) {
