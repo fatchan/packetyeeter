@@ -170,6 +170,20 @@ struct {
     __uint(type, BPF_MAP_TYPE_LRU_HASH);
     __uint(max_entries, BLOCK_MAP_SIZE);
     __type(key, __u32);
+    __type(value, __u64);
+} http3_seen_ips SEC(".maps");
+
+struct {
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);
+    __uint(max_entries, BLOCK_MAP_SIZE);
+    __type(key, struct in6_addr);
+    __type(value, __u64);
+} http3_seen_ips_v6 SEC(".maps");
+
+struct {
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);
+    __uint(max_entries, BLOCK_MAP_SIZE);
+    __type(key, __u32);
     __type(value, struct rate_limit);
 } udp_rates SEC(".maps");
 
@@ -318,6 +332,30 @@ static __always_inline int check_rate_limit(void *map, void *key, __u32 limit, _
         bpf_map_update_elem(map, key, &new_rate, BPF_ANY);
         return 0;
     }
+}
+
+static __always_inline int is_http3_seen_v4(__u32 saddr, __u64 now) {
+    __u64 *expires_at = bpf_map_lookup_elem(&http3_seen_ips, &saddr);
+    if (!expires_at) {
+        return 0;
+    }
+    if (*expires_at > now) {
+        return 1;
+    }
+    bpf_map_delete_elem(&http3_seen_ips, &saddr);
+    return 0;
+}
+
+static __always_inline int is_http3_seen_v6(struct in6_addr *saddr, __u64 now) {
+    __u64 *expires_at = bpf_map_lookup_elem(&http3_seen_ips_v6, saddr);
+    if (!expires_at) {
+        return 0;
+    }
+    if (*expires_at > now) {
+        return 1;
+    }
+    bpf_map_delete_elem(&http3_seen_ips_v6, saddr);
+    return 0;
 }
 
 static __always_inline int check_tcp_flags(struct tcphdr *tcp) {
@@ -651,6 +689,10 @@ int xdp_filter(struct xdp_md *ctx) {
                  emit_incident_v4(ctx, saddr, INCIDENT_UDP_FRAG, now);
                  if (!is_monitor) return XDP_DROP;
              }
+
+             if (is_http3_seen_v4(saddr, now)) {
+                 return XDP_PASS;
+             }
              
              // Rate Limit UDP
              __u32 key_udp_limit = 2;
@@ -740,6 +782,10 @@ int xdp_filter(struct xdp_md *ctx) {
         // Note: Fragmentation in IPv6 is an extension header (44). 
         // For simple UDP flood protection, we check if nexthdr is UDP.
         if (ip6->nexthdr == IPPROTO_UDP) {
+             if (is_http3_seen_v6(&saddr, now)) {
+                 return XDP_PASS;
+             }
+
              __u32 key_udp_limit = 2; // Shared threshold
              __u32 *udp_thresh = bpf_map_lookup_elem(&config_map, &key_udp_limit);
              __u32 limit = 2500;

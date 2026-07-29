@@ -2,6 +2,7 @@ package ratelimit
 
 import (
 	"net"
+	"strings"
 	"sync"
 	"time"
 )
@@ -93,8 +94,24 @@ func DefaultConfig() Config {
 
 // NewLimiter creates a new rate limiter
 func NewLimiter(cfg Config) *Limiter {
-	if cfg.IPRate == 0 {
-		cfg = DefaultConfig()
+	defaults := DefaultConfig()
+	if cfg.IPRate <= 0 {
+		cfg.IPRate = defaults.IPRate
+	}
+	if cfg.ASNRate <= 0 {
+		cfg.ASNRate = defaults.ASNRate
+	}
+	if cfg.IPBurst <= 0 {
+		cfg.IPBurst = defaults.IPBurst
+	}
+	if cfg.ASNBurst <= 0 {
+		cfg.ASNBurst = defaults.ASNBurst
+	}
+	if cfg.CleanupInterval <= 0 {
+		cfg.CleanupInterval = defaults.CleanupInterval
+	}
+	if cfg.MaxAge <= 0 {
+		cfg.MaxAge = defaults.MaxAge
 	}
 
 	l := &Limiter{
@@ -113,6 +130,23 @@ func NewLimiter(cfg Config) *Limiter {
 	go l.cleanupLoop()
 
 	return l
+}
+
+// normalizeASNBucketKey collapses empty and placeholder ASN values so they do
+// not all get forced through a single shared ASN bucket when ASN enrichment is
+// unavailable or inconclusive.
+func normalizeASNBucketKey(asn string) string {
+	normalized := strings.TrimSpace(asn)
+	if normalized == "" {
+		return ""
+	}
+
+	switch strings.ToLower(normalized) {
+	case "unknown", "n/a", "na", "none", "null", "unset":
+		return ""
+	default:
+		return normalized
+	}
 }
 
 // AllowIP checks if a request from an IP is allowed
@@ -136,6 +170,7 @@ func (l *Limiter) AllowIP(ip net.IP) bool {
 
 // AllowASN checks if a request from an ASN is allowed
 func (l *Limiter) AllowASN(asn string) bool {
+	asn = normalizeASNBucketKey(asn)
 	if asn == "" {
 		return true // Allow if no ASN
 	}

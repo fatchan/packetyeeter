@@ -37,6 +37,8 @@ func main() {
 		udpThreshold               = flag.Uint("udp-threshold", 0, "Kernel/XDP UDP per-source PPS threshold (0 = use built-in BPF default)")
 		icmpSignalThreshold        = flag.Float64("icmp-signal-threshold", 1000, "Minimum per-source ICMP PPS before collector sends a flood signal to analyzer")
 		udpSignalThreshold         = flag.Float64("udp-signal-threshold", 1000, "Minimum per-source UDP PPS before collector sends a flood signal to analyzer")
+		http3SeenTTL               = flag.Duration("http3-seen-ttl", 10*time.Minute, "How long a peer-fed HTTP/3-seen IP should be exempt from UDP rate limiting")
+		verboseMapEntryUpdates     = flag.Bool("verbose-map-entry-updates", false, "Enable verbose logging for HAProxy peer stick-table/map entry updates")
 		dryRun                     = flag.Bool("dry-run", false, "Monitor mode: log/count the collector's own kernel-space detections (bad flags, SYN flood, ICMP/UDP rate limits) without dropping traffic")
 		showVersion                = flag.Bool("version", false, "Print build version and exit")
 		verbose                    = flag.Bool("v", false, "Verbose logging")
@@ -74,6 +76,8 @@ func main() {
 		UDPThreshold:               uint32(*udpThreshold),
 		ICMPSignalThreshold:        *icmpSignalThreshold,
 		UDPSignalThreshold:         *udpSignalThreshold,
+		HTTP3SeenTTL:               *http3SeenTTL,
+		VerboseMapEntryUpdates:     *verboseMapEntryUpdates,
 		DryRun:                     *dryRun,
 	}
 

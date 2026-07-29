@@ -1,5 +1,11 @@
 package ebpf
 
+import (
+	"encoding/binary"
+	"net"
+	"time"
+)
+
 const (
 	// configKeyICMPThreshold is the config_map array index checked by the XDP
 	// program (as `key_icmp_limit = 0` in protector.bpf.c) for IPv4 and IPv6
@@ -63,4 +69,65 @@ func (m *Maps) SetUDPThreshold(limit uint32) error {
 		return nil
 	}
 	return m.ConfigMap.Put(configKeyUDPThreshold, limit)
+}
+
+func (m *Maps) MarkHTTP3SeenIP(ip net.IP, ttl time.Duration) error {
+	expiresAt := uint64(time.Now().Add(ttl).UnixNano())
+
+	if ip4 := ip.To4(); ip4 != nil {
+		if m.HTTP3SeenIPs == nil {
+			return nil
+		}
+		return m.HTTP3SeenIPs.Put(binary.LittleEndian.Uint32(ip4), expiresAt)
+	}
+
+	if ip16 := ip.To16(); ip16 != nil {
+		if m.HTTP3SeenIPsV6 == nil {
+			return nil
+		}
+		var key [16]byte
+		copy(key[:], ip16)
+		return m.HTTP3SeenIPsV6.Put(key, expiresAt)
+	}
+
+	return nil
+}
+
+func (m *Maps) IsHTTP3SeenIP(ip net.IP) bool {
+	now := uint64(time.Now().UnixNano())
+
+	if ip4 := ip.To4(); ip4 != nil {
+		if m.HTTP3SeenIPs == nil {
+			return false
+		}
+		key := binary.LittleEndian.Uint32(ip4)
+		var expiresAt uint64
+		if err := m.HTTP3SeenIPs.Lookup(key, &expiresAt); err != nil {
+			return false
+		}
+		if expiresAt > now {
+			return true
+		}
+		_ = m.HTTP3SeenIPs.Delete(key)
+		return false
+	}
+
+	if ip16 := ip.To16(); ip16 != nil {
+		if m.HTTP3SeenIPsV6 == nil {
+			return false
+		}
+		var key [16]byte
+		copy(key[:], ip16)
+		var expiresAt uint64
+		if err := m.HTTP3SeenIPsV6.Lookup(key, &expiresAt); err != nil {
+			return false
+		}
+		if expiresAt > now {
+			return true
+		}
+		_ = m.HTTP3SeenIPsV6.Delete(key)
+		return false
+	}
+
+	return false
 }

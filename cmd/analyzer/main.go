@@ -12,9 +12,12 @@ import (
 
 	"PacketYeeter/pkg/analyzer"
 	"PacketYeeter/pkg/buildinfo"
+	"PacketYeeter/pkg/ratelimit"
 )
 
 func main() {
+	defaultRateLimitCfg := ratelimit.DefaultConfig()
+
 	var (
 		listenAddr       = flag.String("listen-addr", "0.0.0.0:9090", "gRPC listen address")
 		metricsAddr      = flag.String("metrics-addr", ":9091", "Prometheus metrics HTTP listen address")
@@ -37,6 +40,10 @@ func main() {
 		aiWorkers        = flag.Int("ai-workers", 16, "AI engine worker count")
 		aiQueueSize      = flag.Int("ai-queue-size", 10000, "AI engine signal queue size")
 		mlModelPath      = flag.String("ml-model", "", "Path to ONNX ML model file (optional, enables ML-based confidence adjustment)")
+		rateLimitIPRate  = flag.Float64("ratelimit-ip-rate", defaultRateLimitCfg.IPRate, "Analyzer rate limiter: allowed signals per second per IP")
+		rateLimitIPBurst = flag.Float64("ratelimit-ip-burst", defaultRateLimitCfg.IPBurst, "Analyzer rate limiter: burst capacity per IP")
+		rateLimitASNRate = flag.Float64("ratelimit-asn-rate", defaultRateLimitCfg.ASNRate, "Analyzer rate limiter: allowed signals per second per ASN")
+		rateLimitASNBurst = flag.Float64("ratelimit-asn-burst", defaultRateLimitCfg.ASNBurst, "Analyzer rate limiter: burst capacity per ASN")
 		dryRun           = flag.Bool("dry-run", false, "Monitor mode - log detections but don't send BLOCK commands")
 		showVersion      = flag.Bool("version", false, "Print build version and exit")
 		verbose          = flag.Bool("v", false, "Verbose logging")
@@ -74,7 +81,13 @@ func main() {
 		AIWorkers:                    *aiWorkers,
 		AIQueueSize:                  *aiQueueSize,
 		MLModelPath:                  *mlModelPath,
-		DryRun:                       *dryRun,
+		RateLimitConfig: ratelimit.Config{
+			IPRate:   *rateLimitIPRate,
+			IPBurst:  *rateLimitIPBurst,
+			ASNRate:  *rateLimitASNRate,
+			ASNBurst: *rateLimitASNBurst,
+		},
+		DryRun: *dryRun,
 	}
 
 	a, err := analyzer.New(cfg)

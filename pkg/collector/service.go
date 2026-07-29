@@ -52,6 +52,8 @@ type Config struct {
 	UDPThreshold               uint32        // Kernel/XDP UDP per-source PPS threshold (0 = BPF default)
 	ICMPSignalThreshold        float64       // Minimum ICMP PPS before sending a flood signal to analyzer
 	UDPSignalThreshold         float64       // Minimum UDP PPS before sending a flood signal to analyzer
+	HTTP3SeenTTL               time.Duration // How long peer-fed HTTP/3-seen IPs remain exempt from UDP kernel/userspace rate handling
+	VerboseMapEntryUpdates     bool          // Verbose logging for HAProxy peer stick-table/map update churn
 	DryRun                     bool          // If true, the collector's own kernel-space detections (bad flags, SYN flood, ICMP/UDP rate limits) log/count but never drop traffic
 }
 
@@ -100,8 +102,10 @@ type Collector struct {
 	dropLogCount int
 
 	// Previous rates to compute pps across windows (monotonic timestamps)
-	prevICMPRates map[uint32]prevRate
-	prevUDPRates  map[uint32]prevRate
+	prevICMPRates   map[uint32]prevRate
+	prevICMPRatesV6 map[[16]byte]prevRate
+	prevUDPRates    map[uint32]prevRate
+	prevUDPRatesV6  map[[16]byte]prevRate
 
 	// Last-alerted timestamps for bad TCP flag scans, so repeated polls
 	// don't re-emit a signal for the same kernel-observed event.
@@ -152,7 +156,9 @@ func New(cfg Config, logger *logrus.Logger) (*Collector, error) {
 		signalQueue:        make(chan *apiv1.Signal, max(cfg.SignalQueueSize, 10000)), // Ring buffer default 10k
 		synCacheTTL:        60 * time.Second,                                          // TTL for SYN timestamp cache
 		prevICMPRates:      make(map[uint32]prevRate),
+		prevICMPRatesV6:    make(map[[16]byte]prevRate),
 		prevUDPRates:       make(map[uint32]prevRate),
+		prevUDPRatesV6:     make(map[[16]byte]prevRate),
 		prevBadFlagsSeen:   make(map[uint32]uint64),
 		prevBadFlagsSeenV6: make(map[[16]byte]uint64),
 		dynamicAllowedNets: make(map[string]*net.IPNet),
@@ -277,7 +283,7 @@ func (c *Collector) Start(ctx context.Context) error {
 	}
 
 	if c.Config.HAProxyPort > 0 {
-		c.haproxyPeerServer = haproxy.NewServer(c.Config.HAProxyPort, c.Maps)
+		c.haproxyPeerServer = haproxy.NewServer(c.Config.HAProxyPort, c.Maps, c.Config.HTTP3SeenTTL, c.Config.VerboseMapEntryUpdates)
 		c.wg.Add(1)
 		go func() {
 			defer c.wg.Done()
@@ -354,6 +360,8 @@ func (c *Collector) Start(ctx context.Context) error {
 	c.Logger.WithFields(logrus.Fields{
 		"icmp_signal_threshold_pps": effectiveSignalThreshold(c.Config.ICMPSignalThreshold),
 		"udp_signal_threshold_pps":  effectiveSignalThreshold(c.Config.UDPSignalThreshold),
+		"http3_seen_ttl":            c.Config.HTTP3SeenTTL,
+		"verbose_map_entry_updates": c.Config.VerboseMapEntryUpdates,
 	}).Info("Configured userspace flood-signal thresholds")
 
 	c.Logger.Info("Collector started")
@@ -1133,7 +1141,7 @@ func (c *Collector) sendICMPRates() {
 
 // sendUDPRates sends UDP rate data to analyzer
 func (c *Collector) sendUDPRates() {
-	if c.Maps == nil || c.Maps.UDPRates == nil {
+	if c.Maps == nil || (c.Maps.UDPRates == nil && c.Maps.UDPRatesV6 == nil) {
 		return
 	}
 
@@ -1142,58 +1150,127 @@ func (c *Collector) sendUDPRates() {
 	sentCount := 0
 	totalPPS := 0.0
 
-	var ip uint32
-	var rate ebpf.ICMPRate // Same struct for UDP
+	if c.Maps.UDPRates != nil {
+		var ip uint32
+		var rate ebpf.ICMPRate // Same struct for UDP
 
-	iter := c.Maps.UDPRates.Iterate()
-	for iter.Next(&ip, &rate) {
-		if rate.Count == 0 {
-			continue
+		iter := c.Maps.UDPRates.Iterate()
+		for iter.Next(&ip, &rate) {
+			if rate.Count == 0 {
+				continue
+			}
+
+			// Stop if we hit batch size limit
+			if sentCount >= maxBatchSize {
+				break
+			}
+
+			ipBytes := make([]byte, 4)
+			binary.LittleEndian.PutUint32(ipBytes, ip)
+			ipAddr := net.IP(ipBytes)
+
+			// Skip allowlisted IPs
+			if c.checkAllowlist(ipAddr) {
+				continue
+			}
+
+			// Skip HTTP/3-seen IPs so collector userspace mirrors the kernel/XDP UDP exemption.
+			if c.Maps.IsHTTP3SeenIP(ipAddr) {
+				continue
+			}
+
+			asn, org := "", ""
+			if c.GeoIP != nil {
+				asn, org = c.GeoIP.Lookup(ipAddr)
+			}
+
+			pps := computePPS(c.prevUDPRates, ip, rate)
+			if pps < minFloodPPS {
+				continue
+			}
+			totalPPS += pps
+
+			signal := &apiv1.Signal{
+				Id:        fmt.Sprintf("udp-%d", ip),
+				Timestamp: timestamppb.Now(),
+				Type:      apiv1.SignalType_SIGNAL_UDP_FLOOD,
+				Source:    apiv1.SignalSource_SOURCE_EBPF,
+				Ip:        ipBytes,
+				Asn:       asn,
+				Org:       org,
+				Weight:    pps,
+				Metadata: map[string]string{
+					"count":     fmt.Sprintf("%d", rate.Count),
+					"last_time": fmt.Sprintf("%d", rate.LastTime),
+					"pps":       fmt.Sprintf("%.2f", pps),
+				},
+			}
+
+			c.sendSignal(signal)
+			sentCount++
 		}
+	}
 
-		// Stop if we hit batch size limit
-		if sentCount >= maxBatchSize {
-			break
+	if c.Maps.UDPRatesV6 != nil && sentCount < maxBatchSize {
+		var ip [16]byte
+		var rate ebpf.ICMPRate // Same struct for UDP
+
+		iter := c.Maps.UDPRatesV6.Iterate()
+		for iter.Next(&ip, &rate) {
+			if rate.Count == 0 {
+				continue
+			}
+
+			if sentCount >= maxBatchSize {
+				break
+			}
+
+			ipAddr := net.IP(ip[:])
+
+			// Skip allowlisted IPs
+			if c.checkAllowlist(ipAddr) {
+				continue
+			}
+
+			// Skip HTTP/3-seen IPs so collector userspace mirrors the kernel/XDP UDP exemption.
+			if c.Maps.IsHTTP3SeenIP(ipAddr) {
+				continue
+			}
+
+			asn, org := "", ""
+			if c.GeoIP != nil {
+				asn, org = c.GeoIP.Lookup(ipAddr)
+			}
+
+			pps := computePPSV6(c.prevUDPRatesV6, ip, rate)
+			if pps < minFloodPPS {
+				continue
+			}
+			totalPPS += pps
+
+			signal := &apiv1.Signal{
+				Id:        fmt.Sprintf("udp6-%x", ip),
+				Timestamp: timestamppb.Now(),
+				Type:      apiv1.SignalType_SIGNAL_UDP_FLOOD,
+				Source:    apiv1.SignalSource_SOURCE_EBPF,
+				Ip:        ip[:],
+				Asn:       asn,
+				Org:       org,
+				Weight:    pps,
+				Metadata: map[string]string{
+					"count":     fmt.Sprintf("%d", rate.Count),
+					"last_time": fmt.Sprintf("%d", rate.LastTime),
+					"pps":       fmt.Sprintf("%.2f", pps),
+				},
+			}
+
+			c.sendSignal(signal)
+			sentCount++
 		}
+	}
 
-		ipBytes := make([]byte, 4)
-		binary.LittleEndian.PutUint32(ipBytes, ip)
-		ipAddr := net.IP(ipBytes)
-
-		// Skip allowlisted IPs
-		if c.checkAllowlist(ipAddr) {
-			continue
-		}
-
-		asn, org := "", ""
-		if c.GeoIP != nil {
-			asn, org = c.GeoIP.Lookup(ipAddr)
-		}
-
-		pps := computePPS(c.prevUDPRates, ip, rate)
-		if pps < minFloodPPS {
-			continue
-		}
-		totalPPS += pps
-
-		signal := &apiv1.Signal{
-			Id:        fmt.Sprintf("udp-%d", ip),
-			Timestamp: timestamppb.Now(),
-			Type:      apiv1.SignalType_SIGNAL_UDP_FLOOD,
-			Source:    apiv1.SignalSource_SOURCE_EBPF,
-			Ip:        ipBytes,
-			Asn:       asn,
-			Org:       org,
-			Weight:    pps,
-			Metadata: map[string]string{
-				"count":     fmt.Sprintf("%d", rate.Count),
-				"last_time": fmt.Sprintf("%d", rate.LastTime),
-				"pps":       fmt.Sprintf("%.2f", pps),
-			},
-		}
-
-		c.sendSignal(signal)
-		sentCount++
+	if sentCount > 0 {
+		c.Logger.WithField("count", sentCount).Debug("Sent UDP flood signals")
 	}
 }
 
@@ -1308,6 +1385,25 @@ func (c *Collector) sendBadFlagsAlerts() {
 }
 
 func computePPS(prev map[uint32]prevRate, ip uint32, rate ebpf.ICMPRate) float64 {
+	if prev == nil {
+		return float64(rate.Count)
+	}
+	pr, ok := prev[ip]
+	prev[ip] = prevRate{lastTime: rate.LastTime, count: rate.Count}
+	if !ok {
+		return float64(rate.Count)
+	}
+	if rate.LastTime == pr.lastTime {
+		return float64(rate.Count)
+	}
+	if rate.LastTime > pr.lastTime && rate.Count < pr.count {
+		// Window rolled; use previous window's peak count
+		return float64(pr.count)
+	}
+	return float64(rate.Count)
+}
+
+func computePPSV6(prev map[[16]byte]prevRate, ip [16]byte, rate ebpf.ICMPRate) float64 {
 	if prev == nil {
 		return float64(rate.Count)
 	}
