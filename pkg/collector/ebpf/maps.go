@@ -18,6 +18,8 @@ type Maps struct {
 	ConfigMap           *ebpf.Map
 	UDPRates            *ebpf.Map
 	UDPRatesV6          *ebpf.Map
+	HTTP3SeenIPs        *ebpf.Map
+	HTTP3SeenIPsV6      *ebpf.Map
 	AllowListV4         *ebpf.Map
 	AllowListV6         *ebpf.Map
 	PolicyV4            *ebpf.Map

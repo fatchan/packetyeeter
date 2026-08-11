@@ -29,6 +29,19 @@ type botStats struct {
 	BehavioralPatterns map[string]int `json:"behavioral_patterns"`
 }
 
+type allowlistEntry struct {
+	CIDR    string `json:"cidr"`
+	Dynamic bool   `json:"dynamic"`
+}
+
+type allowlistResponse struct {
+	Status  string           `json:"status"`
+	Total   int              `json:"total"`
+	Dynamic int              `json:"dynamic"`
+	Static  int              `json:"static"`
+	Entries []allowlistEntry `json:"entries"`
+}
+
 func (c *Collector) startManagementSocket() error {
 	if err := prepareUnixSocket(c.Config.SocketPath); err != nil {
 		return err
@@ -183,6 +196,8 @@ func (c *Collector) managementResponse(command string) any {
 			list.MonitorMode = c.Maps.DryRun
 		}
 		return list
+	case "ALLOWLIST", "WHITELIST":
+		return c.getAllowlistResponse()
 	case "REPUTATION":
 		return map[string]any{}
 	case "AI":
@@ -199,6 +214,54 @@ func (c *Collector) managementResponse(command string) any {
 		}
 	default:
 		return map[string]string{"error": fmt.Sprintf("unknown command %q", command)}
+	}
+}
+
+func (c *Collector) getAllowlistResponse() allowlistResponse {
+	c.allowlistMu.RLock()
+	defer c.allowlistMu.RUnlock()
+
+	dynamicSet := make(map[string]struct{}, len(c.dynamicAllowedNets))
+	for key := range c.dynamicAllowedNets {
+		dynamicSet[key] = struct{}{}
+	}
+
+	seen := make(map[string]struct{}, len(c.allowedNets))
+	entries := make([]allowlistEntry, 0, len(c.allowedNets))
+	dynamicCount := 0
+	staticCount := 0
+
+	for _, n := range c.allowedNets {
+		key := normalizeIPNet(n)
+		if key == "" {
+			continue
+		}
+		if _, exists := seen[key]; exists {
+			continue
+		}
+		seen[key] = struct{}{}
+
+		_, isDynamic := dynamicSet[key]
+		if isDynamic {
+			dynamicCount++
+		} else {
+			staticCount++
+		}
+
+		entries = append(entries, allowlistEntry{
+			CIDR:    key,
+			Dynamic: isDynamic,
+		})
+	}
+
+	sortAllowlistEntries(entries)
+
+	return allowlistResponse{
+		Status:  c.dynamicAllowlistStatus(),
+		Total:   len(entries),
+		Dynamic: dynamicCount,
+		Static:  staticCount,
+		Entries: entries,
 	}
 }
 

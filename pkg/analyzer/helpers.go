@@ -54,8 +54,8 @@ var (
 func trackBlocked(ip net.IP, asn string) {
 	now := time.Now()
 	window := 60 * time.Second
+
 	blockedMu.Lock()
-	defer blockedMu.Unlock()
 	if ip != nil {
 		blockedIPs[ip.String()] = now
 	}
@@ -74,8 +74,12 @@ func trackBlocked(ip net.IP, asn string) {
 			delete(blockedASNs, k)
 		}
 	}
-	metrics.RateLimitCurrentlyBlockedIPs.Set(float64(len(blockedIPs)))
-	metrics.RateLimitCurrentlyBlockedASNs.Set(float64(len(blockedASNs)))
+	blockedIPCount := len(blockedIPs)
+	blockedASNCount := len(blockedASNs)
+	blockedMu.Unlock()
+
+	metrics.RateLimitCurrentlyBlockedIPs.Set(float64(blockedIPCount))
+	metrics.RateLimitCurrentlyBlockedASNs.Set(float64(blockedASNCount))
 }
 
 // checkRateLimit checks if IP or ASN has exceeded rate limits

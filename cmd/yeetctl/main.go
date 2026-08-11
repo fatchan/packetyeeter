@@ -24,6 +24,23 @@ type kv struct {
 	Count int
 }
 
+type allowlistEntry struct {
+	CIDR    string `json:"cidr"`
+	Dynamic bool   `json:"dynamic"`
+}
+
+type allowlistResponse struct {
+	Status  string           `json:"status"`
+	Total   int              `json:"total"`
+	Dynamic int              `json:"dynamic"`
+	Static  int              `json:"static"`
+	Entries []allowlistEntry `json:"entries"`
+}
+
+type errorResponse struct {
+	Error string `json:"error"`
+}
+
 func sortedEntries(m map[string]int) []kv {
 	out := make([]kv, 0, len(m))
 	for k, v := range m {
@@ -47,6 +64,7 @@ func main() {
 		fmt.Println("Usage: yeetctl [options] <command>")
 		fmt.Println("Commands:")
 		fmt.Println("  list       - List blocked IPs")
+		fmt.Println("  whitelist  - List current allowlist entries")
 		fmt.Println("  reputation - List full reputation table")
 		fmt.Println("  ai         - Show AI scraper detections summary")
 		fmt.Println("  bots       - Show bot categorization summary")
@@ -95,6 +113,37 @@ func main() {
 		if len(list.IPv6) == 0 {
 			fmt.Println("  (none)")
 		}
+	} else if Command == "whitelist" || Command == "allowlist" {
+		_, err = conn.Write([]byte("WHITELIST"))
+		if err != nil {
+			fmt.Printf("Failed to send command: %v\n", err)
+			os.Exit(1)
+		}
+
+		var resp allowlistResponse
+		if err := json.NewDecoder(conn).Decode(&resp); err != nil {
+			fmt.Printf("Failed to read response: %v\n", err)
+			os.Exit(1)
+		}
+
+		if resp.Total == 0 && len(resp.Entries) == 0 {
+			fmt.Println("Allowlist")
+			fmt.Printf("Status: %s\n", resp.Status)
+			fmt.Printf("Total: %d (static=%d dynamic=%d)\n", resp.Total, resp.Static, resp.Dynamic)
+			fmt.Println("  (none)")
+			return
+		}
+
+		fmt.Println("Allowlist")
+		fmt.Printf("Status: %s\n", resp.Status)
+		fmt.Printf("Total: %d (static=%d dynamic=%d)\n", resp.Total, resp.Static, resp.Dynamic)
+		for _, entry := range resp.Entries {
+			source := "static"
+			if entry.Dynamic {
+				source = "dynamic"
+			}
+			fmt.Printf("  - %-39s [%s]\n", entry.CIDR, source)
+		}
 	} else if Command == "reputation" || Command == "scores" {
 		_, err = conn.Write([]byte("REPUTATION"))
 		if err != nil {
@@ -112,7 +161,6 @@ func main() {
 		fmt.Printf("%-40s | %-10s | %-10s | %-20s\n", "Entity", "Score", "Offenses", "Last Seen")
 		fmt.Println("-----------------------------------------------------------------------------------------")
 
-		// Sort keys for consistent output
 		keys := make([]string, 0, len(entries))
 		for k := range entries {
 			keys = append(keys, k)

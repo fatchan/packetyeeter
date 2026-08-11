@@ -15,6 +15,7 @@ import (
 
 	apiv1 "PacketYeeter/api/proto/v1"
 	"PacketYeeter/pkg/collector/ebpf"
+	"PacketYeeter/pkg/collector/haproxy"
 	"PacketYeeter/pkg/collector/haproxy/spoe"
 	"PacketYeeter/pkg/geoip"
 	"PacketYeeter/pkg/metrics"
@@ -32,18 +33,29 @@ import (
 
 // Config holds collector configuration
 type Config struct {
-	Interface       string
-	AnalyzerAddr    string
-	MetricsAddr     string
-	SPOEAddr        string // e.g., ":9876"
-	SocketPath      string
-	GeoIPASNPath    string
-	AllowlistCIDRs  string // Comma-separated CIDRs
-	PolicyRules     string // Comma-separated CIDR=action rules (action = block|monitor)
-	BlockDuration   time.Duration
-	PollInterval    time.Duration // How often to poll eBPF maps and send to analyzer
-	SignalQueueSize int           // Collector signal queue size (default 10000)
-	DryRun          bool          // If true, the collector's own kernel-space detections (bad flags, SYN flood, ICMP/UDP rate limits) log/count but never drop traffic
+	Interface                  string
+	AnalyzerAddr               string
+	MetricsAddr                string
+	SPOEAddr                   string // e.g., ":9876"
+	HAProxyPort                int
+	SocketPath                 string
+	GeoIPASNPath               string
+	AllowlistCIDRs             string // Comma-separated CIDRs
+	PolicyRules                string // Comma-separated CIDR=action rules (action = block|monitor)
+	DynamicAllowlistSocketPath string // Path to HAProxy runtime Unix socket for dynamic allowlist syncing; empty disables runtime syncing
+	DynamicAllowlistInterval   time.Duration
+	HAProxyWhitelistMapPath    string        // Path to HAProxy whitelist map containing incoming IPs that should always be allowed
+	HAProxyBackendsMapPath     string        // Path to HAProxy backends map containing backend hosts that should always be allowed
+	BlockDuration              time.Duration // Default block duration
+	PollInterval               time.Duration // How often to poll eBPF maps and send to analyzer
+	SignalQueueSize            int           // Collector signal queue size (default 10000)
+	ICMPThreshold              uint32        // Kernel/XDP ICMP per-source PPS threshold (0 = BPF default)
+	UDPThreshold               uint32        // Kernel/XDP UDP per-source PPS threshold (0 = BPF default)
+	ICMPSignalThreshold        float64       // Minimum ICMP PPS before sending a flood signal to analyzer
+	UDPSignalThreshold         float64       // Minimum UDP PPS before sending a flood signal to analyzer
+	HTTP3SeenTTL               time.Duration // How long peer-fed HTTP/3-seen IPs remain exempt from UDP kernel/userspace rate handling
+	VerboseMapEntryUpdates     bool          // Verbose logging for HAProxy peer stick-table/map update churn
+	DryRun                     bool          // If true, the collector's own kernel-space detections (bad flags, SYN flood, ICMP/UDP rate limits) log/count but never drop traffic
 
 	// EgressAccounting enables the eBPF TC egress per-client byte counters that
 	// feed the analyzer's sustained-download detection. Off by default: it adds
@@ -70,22 +82,25 @@ type prevRate struct {
 	count    uint64
 }
 
+type incidentLogThrottleState struct {
+	lastLog    time.Time
+	suppressed uint64
+}
+
 type Collector struct {
 	Config Config
 
 	// Components
-	Loader *ebpf.Loader
-	Maps   *ebpf.Maps
-	GeoIP  *geoip.Provider
-	Logger *logrus.Logger
-	// allowedNetsMu guards allowedNets: executeCommand mutates it on the
-	// command-stream goroutine while checkAllowlist reads it from the map
-	// polling, perf-event, and SPOE goroutines.
-	allowedNetsMu  sync.RWMutex
-	allowedNets    []*net.IPNet
-	policyRules    []ebpf.PolicyRule
-	perfReader     *perf.Reader
-	incidentReader *perf.Reader
+	Loader             *ebpf.Loader
+	Maps               *ebpf.Maps
+	GeoIP              *geoip.Provider
+	Logger             *logrus.Logger
+	allowedNets        []*net.IPNet
+	dynamicAllowedNets map[string]*net.IPNet
+	allowlistMu        sync.RWMutex
+	policyRules        []ebpf.PolicyRule
+	perfReader         *perf.Reader
+	incidentReader     *perf.Reader
 
 	// gRPC connection to analyzer
 	analyzerConn   *grpc.ClientConn
@@ -121,8 +136,16 @@ type Collector struct {
 	synCache    sync.Map // IP string -> time.Time
 	synCacheTTL time.Duration
 
+	// Aggregate high-volume incident logs by reason to keep logging cheap
+	// while preserving exact Prometheus counters.
+	incidentLogMu    sync.Mutex
+	incidentLogState map[string]*incidentLogThrottleState
+
 	// SPOE agent
 	spoeAgent *spoe.CollectorAgent
+
+	// HAProxy peer listener
+	haproxyPeerServer *haproxy.Server
 
 	// Metrics server
 	metricsServer *http.Server
@@ -160,6 +183,8 @@ func New(cfg Config, logger *logrus.Logger) (*Collector, error) {
 		prevBadFlagsSeenV6: make(map[[16]byte]uint64),
 		prevEgressBytes:    make(map[uint32]prevEgress),
 		prevEgressBytesV6:  make(map[[16]byte]prevEgress),
+		dynamicAllowedNets: make(map[string]*net.IPNet),
+		incidentLogState:   make(map[string]*incidentLogThrottleState),
 	}
 
 	// Load GeoIP database
@@ -218,6 +243,18 @@ func (c *Collector) Start(ctx context.Context) error {
 	}
 	c.Maps = c.Loader.GetMaps()
 	c.Logger.Info("eBPF programs loaded and attached")
+
+	if err := c.Maps.SetICMPThreshold(c.Config.ICMPThreshold); err != nil {
+		c.Logger.WithError(err).Warn("Failed to configure kernel/XDP ICMP threshold; BPF default may still apply")
+	} else if c.Config.ICMPThreshold > 0 {
+		c.Logger.WithField("threshold_pps", c.Config.ICMPThreshold).Info("Configured kernel/XDP ICMP threshold")
+	}
+
+	if err := c.Maps.SetUDPThreshold(c.Config.UDPThreshold); err != nil {
+		c.Logger.WithError(err).Warn("Failed to configure kernel/XDP UDP threshold; BPF default may still apply")
+	} else if c.Config.UDPThreshold > 0 {
+		c.Logger.WithField("threshold_pps", c.Config.UDPThreshold).Info("Configured kernel/XDP UDP threshold")
+	}
 
 	// Enable kernel-space monitor/dry-run mode if requested. This is
 	// independent of the analyzer's own -dry-run flag: it governs whether
@@ -294,6 +331,30 @@ func (c *Collector) Start(ctx context.Context) error {
 		c.Logger.WithError(err).Warn("Failed to start incident event reader, structured incident logging will be unavailable")
 	}
 
+	if c.Config.HAProxyPort > 0 {
+		c.haproxyPeerServer = haproxy.NewServer(c.Config.HAProxyPort, c.Maps, c.Config.HTTP3SeenTTL, c.Config.VerboseMapEntryUpdates)
+		c.wg.Add(1)
+		go func() {
+			defer c.wg.Done()
+			if err := c.haproxyPeerServer.Start(); err != nil {
+				if c.ctx.Err() == nil {
+					c.Logger.WithError(err).Error("HAProxy peer listener error")
+				}
+			}
+		}()
+	}
+
+	if c.Config.DynamicAllowlistSocketPath != "" {
+		c.Logger.WithFields(logrus.Fields{
+			"socket_path":        c.Config.DynamicAllowlistSocketPath,
+			"interval":           c.Config.DynamicAllowlistInterval,
+			"whitelist_map_path": c.Config.HAProxyWhitelistMapPath,
+			"backends_map_path":  c.Config.HAProxyBackendsMapPath,
+		}).Info("Dynamic allowlist syncing enabled")
+		c.wg.Add(1)
+		go c.runDynamicAllowlistSync()
+	}
+
 	// Start analyzer connection manager (handles reconnection)
 	c.wg.Add(1)
 	go c.manageAnalyzerConnection()
@@ -344,6 +405,13 @@ func (c *Collector) Start(ctx context.Context) error {
 			c.Logger.WithError(err).Error("Metrics server error")
 		}
 	}()
+
+	c.Logger.WithFields(logrus.Fields{
+		"icmp_signal_threshold_pps": effectiveSignalThreshold(c.Config.ICMPSignalThreshold),
+		"udp_signal_threshold_pps":  effectiveSignalThreshold(c.Config.UDPSignalThreshold),
+		"http3_seen_ttl":            c.Config.HTTP3SeenTTL,
+		"verbose_map_entry_updates": c.Config.VerboseMapEntryUpdates,
+	}).Info("Configured userspace flood-signal thresholds")
 
 	c.Logger.Info("Collector started")
 	return nil
@@ -470,8 +538,8 @@ func (c *Collector) checkAllowlist(ip net.IP) bool {
 	if ip.IsLoopback() {
 		return true
 	}
-	c.allowedNetsMu.RLock()
-	defer c.allowedNetsMu.RUnlock()
+	c.allowlistMu.RLock()
+	defer c.allowlistMu.RUnlock()
 	for _, subnet := range c.allowedNets {
 		if subnet.Contains(ip) {
 			return true
@@ -483,7 +551,15 @@ func (c *Collector) checkAllowlist(ip net.IP) bool {
 // Stop stops the collector gracefully
 func (c *Collector) Stop() {
 	c.Logger.Info("Stopping collector...")
-	c.cancel()
+	if c.cancel != nil {
+		c.cancel()
+	}
+
+	if c.haproxyPeerServer != nil {
+		if err := c.haproxyPeerServer.Stop(); err != nil {
+			c.Logger.WithError(err).Warn("HAProxy peer listener shutdown error")
+		}
+	}
 
 	c.mu.Lock()
 	if c.signalStream != nil {
@@ -599,9 +675,9 @@ func (c *Collector) executeCommand(cmd *apiv1.Command) {
 		} else {
 			ipNet = &net.IPNet{IP: ip, Mask: net.CIDRMask(128, 128)}
 		}
-		c.allowedNetsMu.Lock()
+		c.allowlistMu.Lock()
 		c.allowedNets = append(c.allowedNets, ipNet)
-		c.allowedNetsMu.Unlock()
+		c.allowlistMu.Unlock()
 		if err := c.Maps.AddAllowlistEntry(ipNet); err != nil {
 			logger.WithError(err).Warn("Failed to add IP to kernel-space allowlist")
 		}
@@ -609,7 +685,7 @@ func (c *Collector) executeCommand(cmd *apiv1.Command) {
 
 	case apiv1.CommandType_COMMAND_REMOVE_ALLOWLIST_IP:
 		// Remove IP from allowlist
-		c.allowedNetsMu.Lock()
+		c.allowlistMu.Lock()
 		filtered := make([]*net.IPNet, 0, len(c.allowedNets))
 		removed := make([]*net.IPNet, 0, 1)
 		for _, n := range c.allowedNets {
@@ -620,7 +696,8 @@ func (c *Collector) executeCommand(cmd *apiv1.Command) {
 			removed = append(removed, n)
 		}
 		c.allowedNets = filtered
-		c.allowedNetsMu.Unlock()
+		delete(c.dynamicAllowedNets, normalizeIPNet(ipNetFromIP(ip)))
+		c.allowlistMu.Unlock()
 		for _, n := range removed {
 			if err := c.Maps.RemoveAllowlistEntry(n); err != nil {
 				logger.WithError(err).Warn("Failed to remove IP from kernel-space allowlist")
@@ -832,6 +909,40 @@ func (c *Collector) recordPerfLostSamples(reader string, lost uint64) {
 	}).Warn("Kernel perf-ring samples lost")
 }
 
+const incidentLogThrottleInterval = 5 * time.Second
+
+// logIncidentThrottled keeps exact metrics but rate-limits warning logs.
+// Logs are aggregated by reason so cardinality stays bounded during attacks.
+func (c *Collector) logIncidentThrottled(ip net.IP, reason string, kernelTimestamp uint64) {
+	key := reason
+	now := time.Now()
+
+	c.incidentLogMu.Lock()
+	state, ok := c.incidentLogState[key]
+	if !ok {
+		state = &incidentLogThrottleState{}
+		c.incidentLogState[key] = state
+	}
+
+	if state.lastLog.IsZero() || now.Sub(state.lastLog) >= incidentLogThrottleInterval {
+		suppressed := state.suppressed
+		state.lastLog = now
+		state.suppressed = 0
+		c.incidentLogMu.Unlock()
+
+		c.Logger.WithFields(logrus.Fields{
+			"ip":               ip.String(),
+			"reason":           reason,
+			"kernel_timestamp": kernelTimestamp,
+			"suppressed_count": suppressed,
+		}).Warn("Kernel-space enforcement incident")
+		return
+	}
+
+	state.suppressed++
+	c.incidentLogMu.Unlock()
+}
+
 // processIncidentEvent decodes a single structured incident event and logs
 // it. This is purely a local audit-trail/metrics feature: it does not
 // generate an analyzer signal, since the underlying drop conditions
@@ -856,11 +967,7 @@ func (c *Collector) processIncidentEvent(data []byte) {
 	reason := ebpf.IncidentReasonName(inc.Reason)
 	metrics.KernelIncidents.WithLabelValues(reason).Inc()
 
-	c.Logger.WithFields(logrus.Fields{
-		"ip":               ip.String(),
-		"reason":           reason,
-		"kernel_timestamp": inc.Timestamp,
-	}).Warn("Kernel-space enforcement incident")
+	c.logIncidentThrottled(ip, reason, inc.Timestamp)
 }
 
 func (c *Collector) storeSynTimestamp(ip net.IP) {
@@ -1187,6 +1294,7 @@ func (c *Collector) sendICMPRates() {
 
 	sentCount := 0
 	totalPPS := 0.0
+	minFloodPPS := effectiveSignalThreshold(c.Config.ICMPSignalThreshold)
 
 	if c.Maps.ICMPRates != nil {
 		var ip uint32
@@ -1203,7 +1311,7 @@ func (c *Collector) sendICMPRates() {
 			binary.LittleEndian.PutUint32(ipBytes, ip)
 			pps := computePPS(c.prevICMPRates, ip, rate)
 			if p, sent := c.emitFloodSignal(net.IP(ipBytes), pps, rate,
-				apiv1.SignalType_SIGNAL_ICMP_FLOOD, "icmp"); sent {
+				apiv1.SignalType_SIGNAL_ICMP_FLOOD, "icmp", minFloodPPS); sent {
 				totalPPS += p
 				sentCount++
 			}
@@ -1228,7 +1336,7 @@ func (c *Collector) sendICMPRates() {
 			}
 			pps := computePPSV6(c.prevICMPRatesV6, key, rate)
 			if p, sent := c.emitFloodSignal(net.IP(key[:]), pps, rate,
-				apiv1.SignalType_SIGNAL_ICMP_FLOOD, "icmp6"); sent {
+				apiv1.SignalType_SIGNAL_ICMP_FLOOD, "icmp6", minFloodPPS); sent {
 				totalPPS += p
 				sentCountV6++
 			}
@@ -1251,6 +1359,7 @@ func (c *Collector) sendUDPRates() {
 
 	sentCount := 0
 	totalPPS := 0.0
+	minFloodPPS := effectiveSignalThreshold(c.Config.UDPSignalThreshold)
 
 	if c.Maps.UDPRates != nil {
 		var ip uint32
@@ -1265,9 +1374,13 @@ func (c *Collector) sendUDPRates() {
 			}
 			ipBytes := make([]byte, 4)
 			binary.LittleEndian.PutUint32(ipBytes, ip)
+			ipAddr := net.IP(ipBytes)
+			if c.Maps.IsHTTP3SeenIP(ipAddr) {
+				continue
+			}
 			pps := computePPS(c.prevUDPRates, ip, rate)
-			if p, sent := c.emitFloodSignal(net.IP(ipBytes), pps, rate,
-				apiv1.SignalType_SIGNAL_UDP_FLOOD, "udp"); sent {
+			if p, sent := c.emitFloodSignal(ipAddr, pps, rate,
+				apiv1.SignalType_SIGNAL_UDP_FLOOD, "udp", minFloodPPS); sent {
 				totalPPS += p
 				sentCount++
 			}
@@ -1290,9 +1403,13 @@ func (c *Collector) sendUDPRates() {
 			if rate.Count == 0 {
 				continue
 			}
+			ipAddr := net.IP(key[:])
+			if c.Maps.IsHTTP3SeenIP(ipAddr) {
+				continue
+			}
 			pps := computePPSV6(c.prevUDPRatesV6, key, rate)
-			if p, sent := c.emitFloodSignal(net.IP(key[:]), pps, rate,
-				apiv1.SignalType_SIGNAL_UDP_FLOOD, "udp6"); sent {
+			if p, sent := c.emitFloodSignal(ipAddr, pps, rate,
+				apiv1.SignalType_SIGNAL_UDP_FLOOD, "udp6", minFloodPPS); sent {
 				totalPPS += p
 				sentCountV6++
 			}
@@ -1452,6 +1569,23 @@ func ppsFromWindow(pr prevRate, ok bool, rate ebpf.ICMPRate) float64 {
 	return float64(rate.Count)
 }
 
+func effectiveSignalThreshold(v float64) float64 {
+	if v <= 0 {
+		return 1000.0
+	}
+	return v
+}
+
+func ipNetFromIP(ip net.IP) *net.IPNet {
+	if ip == nil {
+		return nil
+	}
+	if ip4 := ip.To4(); ip4 != nil {
+		return &net.IPNet{IP: ip4, Mask: net.CIDRMask(32, 32)}
+	}
+	return &net.IPNet{IP: ip, Mask: net.CIDRMask(128, 128)}
+}
+
 // The kernel rate/bad-flags maps are LRU_HASH and self-evict under churn, but
 // the userspace bookkeeping maps that shadow them (prevICMPRates, prevUDPRates,
 // their IPv6 variants, and prevBadFlagsSeen/prevBadFlagsSeenV6) are plain Go
@@ -1573,19 +1707,18 @@ func prunePrevSeenMap[K comparable](m map[K]uint64, maxClock uint64, logger *log
 
 // floodRateParams bundles the constants shared by the ICMP/UDP rate readers.
 const (
-	rateMaxBatchSize = 1000   // Limit signals per poll
-	rateMinFloodPPS  = 1000.0 // Avoid false positives on legitimate bursts
+	rateMaxBatchSize = 1000 // Limit signals per poll
 )
 
 // emitFloodSignal applies the allowlist and pps-threshold gates and, if the
 // source qualifies, builds and sends one flood signal. It returns the pps it
 // contributed (0 when skipped) and whether a signal was sent, so v4 and v6
 // callers share identical gating and cannot drift apart.
-func (c *Collector) emitFloodSignal(ipAddr net.IP, pps float64, rate ebpf.ICMPRate, sigType apiv1.SignalType, idPrefix string) (float64, bool) {
+func (c *Collector) emitFloodSignal(ipAddr net.IP, pps float64, rate ebpf.ICMPRate, sigType apiv1.SignalType, idPrefix string, minFloodPPS float64) (float64, bool) {
 	if c.checkAllowlist(ipAddr) {
 		return 0, false
 	}
-	if pps < rateMinFloodPPS {
+	if pps < minFloodPPS {
 		return 0, false
 	}
 	// The rate-map iterators reuse a single key buffer across iterations and

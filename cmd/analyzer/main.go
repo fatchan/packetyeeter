@@ -14,9 +14,12 @@ import (
 	"PacketYeeter/pkg/analyzer"
 	"PacketYeeter/pkg/analyzer/sustained"
 	"PacketYeeter/pkg/buildinfo"
+	"PacketYeeter/pkg/ratelimit"
 )
 
 func main() {
+	defaultRateLimitCfg := ratelimit.DefaultConfig()
+
 	var (
 		listenAddr       = flag.String("listen-addr", "0.0.0.0:9090", "gRPC listen address")
 		metricsAddr      = flag.String("metrics-addr", ":9091", "Prometheus metrics HTTP listen address")
@@ -46,6 +49,10 @@ func main() {
 		aiQueueSize    = flag.Int("ai-queue-size", 10000, "AI engine signal queue size")
 		maxCollectors  = flag.Int("max-collectors", 1024, "Maximum concurrent collector streams (bounds fan-out/goroutines on the unauthenticated signal plane)")
 		mlModelPath    = flag.String("ml-model", "", "Path to ONNX ML model file (optional, enables ML-based confidence adjustment)")
+		rateLimitIPRate  = flag.Float64("ratelimit-ip-rate", defaultRateLimitCfg.IPRate, "Analyzer rate limiter: allowed signals per second per IP")
+		rateLimitIPBurst = flag.Float64("ratelimit-ip-burst", defaultRateLimitCfg.IPBurst, "Analyzer rate limiter: burst capacity per IP")
+		rateLimitASNRate = flag.Float64("ratelimit-asn-rate", defaultRateLimitCfg.ASNRate, "Analyzer rate limiter: allowed signals per second per ASN")
+		rateLimitASNBurst = flag.Float64("ratelimit-asn-burst", defaultRateLimitCfg.ASNBurst, "Analyzer rate limiter: burst capacity per ASN")
 		dryRun         = flag.Bool("dry-run", false, "Monitor mode - log detections but don't send BLOCK commands")
 
 		sustainedDefaults = sustained.DefaultConfig()
@@ -115,7 +122,13 @@ func main() {
 		AIQueueSize:                  *aiQueueSize,
 		MLModelPath:                  *mlModelPath,
 		MaxCollectors:                *maxCollectors,
-		DryRun:                       *dryRun,
+		RateLimitConfig: ratelimit.Config{
+			IPRate:   *rateLimitIPRate,
+			IPBurst:  *rateLimitIPBurst,
+			ASNRate:  *rateLimitASNRate,
+			ASNBurst: *rateLimitASNBurst,
+		},
+		DryRun: *dryRun,
 		Sustained: sustained.Config{
 			Enabled:                           *sustainedEnabled,
 			Enforce:                           *sustainedEnforce,

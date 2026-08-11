@@ -86,6 +86,7 @@ type Config struct {
 	DisableDDoSCategory          bool
 	JA4DBCachePath               string
 	StateDir                     string
+	RateLimitConfig              ratelimit.Config
 	MaxCollectors                int      // Max concurrent collector streams (default 1024)
 	InspectorTrustedHosts        []string // Extra Host/Origin hostnames the inspector trusts for mutating requests (in addition to loopback), e.g. a reverse-proxy hostname
 	DryRun                       bool     // Monitor mode - log detections but don't block
@@ -306,13 +307,37 @@ func New(cfg Config) (*Analyzer, error) {
 		cfg.MaxCollectors = defaultMaxCollectors
 	}
 
+	rateLimitCfg := cfg.RateLimitConfig
+	if rateLimitCfg.IPRate <= 0 || rateLimitCfg.ASNRate <= 0 || rateLimitCfg.IPBurst <= 0 || rateLimitCfg.ASNBurst <= 0 || rateLimitCfg.CleanupInterval <= 0 || rateLimitCfg.MaxAge <= 0 {
+		defaults := ratelimit.DefaultConfig()
+		if rateLimitCfg.IPRate <= 0 {
+			rateLimitCfg.IPRate = defaults.IPRate
+		}
+		if rateLimitCfg.ASNRate <= 0 {
+			rateLimitCfg.ASNRate = defaults.ASNRate
+		}
+		if rateLimitCfg.IPBurst <= 0 {
+			rateLimitCfg.IPBurst = defaults.IPBurst
+		}
+		if rateLimitCfg.ASNBurst <= 0 {
+			rateLimitCfg.ASNBurst = defaults.ASNBurst
+		}
+		if rateLimitCfg.CleanupInterval <= 0 {
+			rateLimitCfg.CleanupInterval = defaults.CleanupInterval
+		}
+		if rateLimitCfg.MaxAge <= 0 {
+			rateLimitCfg.MaxAge = defaults.MaxAge
+		}
+	}
+	cfg.RateLimitConfig = rateLimitCfg
+
 	ctx, cancel := context.WithCancel(context.Background())
 	a := &Analyzer{
 		Config:                 cfg,
 		collectors:             make(map[string]*collectorStream),
 		ipRateLimiters:         make(map[string]*ratelimit.TokenBucket),
 		asnRateLimiters:        make(map[string]*ratelimit.TokenBucket),
-		RateLimiter:            ratelimit.NewLimiter(ratelimit.DefaultConfig()),
+		RateLimiter:            ratelimit.NewLimiter(rateLimitCfg),
 		httpRateByIP:           make(map[string]*ewma.State),
 		httpRateByASN:          make(map[string]*ewma.State),
 		proxyLagByASN:          make(map[string]*ewma.State),
@@ -351,6 +376,13 @@ func (a *Analyzer) Start() error {
 			logrus.Info("GeoIP Database initialized")
 		}
 	}
+
+	logrus.WithFields(logrus.Fields{
+		"ip_rate":   a.Config.RateLimitConfig.IPRate,
+		"ip_burst":  a.Config.RateLimitConfig.IPBurst,
+		"asn_rate":  a.Config.RateLimitConfig.ASNRate,
+		"asn_burst": a.Config.RateLimitConfig.ASNBurst,
+	}).Info("Analyzer rate limiter configured")
 
 	// Initialize Reputation Engine
 	rep := reputation.New(30*time.Minute, 0.95, a.Config.ReputationThreshold)

@@ -62,6 +62,8 @@ func (l *Loader) Load() error {
 		ConfigMap:           l.coll.Maps["config_map"],
 		UDPRates:            l.coll.Maps["udp_rates"],
 		UDPRatesV6:          l.coll.Maps["udp_rates_v6"],
+		HTTP3SeenIPs:        l.coll.Maps["http3_seen_ips"],
+		HTTP3SeenIPsV6:      l.coll.Maps["http3_seen_ips_v6"],
 		AllowListV4:         l.coll.Maps["allowlist_v4"],
 		AllowListV6:         l.coll.Maps["allowlist_v6"],
 		PolicyV4:            l.coll.Maps["policy_v4"],
