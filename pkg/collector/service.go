@@ -199,6 +199,7 @@ func normalizeInterfaces(primary string, interfaces []string) []string {
 
 func New(cfg Config, logger *logrus.Logger) (*Collector, error) {
 	cfg.Interfaces = normalizeInterfaces(cfg.Interface, cfg.Interfaces)
+	cfg.AnalyzerAddr = strings.TrimSpace(cfg.AnalyzerAddr)
 	if len(cfg.Interfaces) == 0 {
 		return nil, fmt.Errorf("no interfaces configured")
 	}
@@ -390,8 +391,12 @@ func (c *Collector) Start(ctx context.Context) error {
 	}
 
 	// Start analyzer connection manager (handles reconnection)
-	c.wg.Add(1)
-	go c.manageAnalyzerConnection()
+	if c.Config.AnalyzerAddr != "" {
+		c.wg.Add(1)
+		go c.manageAnalyzerConnection()
+	} else {
+		c.Logger.Info("No analyzer address configured; analyzer connection disabled")
+	}
 
 	// Start signal sender (drains queue and sends to analyzer)
 	c.wg.Add(1)
