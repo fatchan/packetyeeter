@@ -107,6 +107,7 @@ struct bad_flags_info {
 #define INCIDENT_UDP_FRAG     5 // Fragmented UDP/IPv6 fragment extension header
 #define INCIDENT_BAD_FLAGS    6 // SYN+FIN / Xmas / NULL scan TCP flags
 #define INCIDENT_MALFORMED    7 // Unparseable/over-limit headers (fail-closed drop)
+#define INCIDENT_MAX          8
 
 struct incident_event {
     __u64 timestamp;
@@ -313,6 +314,16 @@ struct {
     __type(value, __u64);
 } egress_bytes_v6 SEC(".maps");
 
+// Exact drop counters by incident reason. This stays out of the perf-event
+// path so Prometheus can see exact totals even when incident events are
+// budgeted/sampled or userspace logging is throttled.
+struct {
+    __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+    __uint(max_entries, INCIDENT_MAX);
+    __type(key, __u32);
+    __type(value, __u64);
+} incident_drop_counts SEC(".maps");
+
 // config_map indices (userspace must stay in sync with pkg/collector/ebpf/config.go):
 //   0 = ICMP rate limit (pps)
 //   1 = monitor/dry-run mode (nonzero = never XDP_DROP)
@@ -367,6 +378,18 @@ struct event_metadata {
 };
 
 // --- Helpers ---
+
+static __always_inline void count_incident_drop(__u8 reason) {
+    __u32 key = reason;
+    __u64 *cnt;
+
+    if (reason == 0 || reason >= INCIDENT_MAX)
+        return;
+
+    cnt = bpf_map_lookup_elem(&incident_drop_counts, &key);
+    if (cnt)
+        (*cnt)++;
+}
 
 // Check rate limit. Returns 1 if limit exceeded (block), 0 if OK.
 // When first_trip is non-NULL it is set to 1 only on the first packet in the
@@ -895,8 +918,10 @@ int xdp_filter(struct xdp_md *ctx) {
     // frame would fall through to XDP_PASS uninspected. Fail closed - we cannot
     // see its L3/L4 to enforce on it - while honoring monitor/dry-run mode.
     if (h_proto == bpf_htons(ETH_P_8021Q) || h_proto == bpf_htons(ETH_P_8021AD)) {
-        if (!is_monitor)
+        if (!is_monitor) {
+            count_incident_drop(INCIDENT_MALFORMED);
             return XDP_DROP;
+        }
     }
 
     if (h_proto == bpf_htons(ETH_P_IP)) {
@@ -927,7 +952,10 @@ int xdp_filter(struct xdp_md *ctx) {
                     bpf_map_update_elem(&policy_blocks, &saddr_policy, &one, BPF_ANY);
                 }
                 emit_incident_v4(ctx, saddr_policy, INCIDENT_POLICY_BLOCK, now);
-                if (!is_monitor) return XDP_DROP;
+                if (!is_monitor) {
+                    count_incident_drop(INCIDENT_POLICY_BLOCK);
+                    return XDP_DROP;
+                }
             }
         }
 
@@ -938,7 +966,10 @@ int xdp_filter(struct xdp_md *ctx) {
         if (val) {
             __sync_fetch_and_add(val, 1);
             emit_incident_v4(ctx, saddr, INCIDENT_BLOCKED_IP, now);
-            if (!is_monitor) return XDP_DROP;
+            if (!is_monitor) {
+                count_incident_drop(INCIDENT_BLOCKED_IP);
+                return XDP_DROP;
+            }
         }
 
         // 2. ICMP Rate Limit
@@ -952,7 +983,10 @@ int xdp_filter(struct xdp_md *ctx) {
              if (check_rate_limit(&icmp_rates, &saddr, limit, now, &first_trip)) {
                  if (first_trip)
                      emit_incident_v4(ctx, saddr, INCIDENT_ICMP_RATE, now);
-                 if (!is_monitor) return XDP_DROP;
+                 if (!is_monitor) {
+                    count_incident_drop(INCIDENT_ICMP_RATE);
+                    return XDP_DROP;
+                 }
              }
         }
         
@@ -963,7 +997,10 @@ int xdp_filter(struct xdp_md *ctx) {
                  // Legacy hard-drop path. Still budget-limited; prefer RATE mode
                  // on low-MTU/VPN paths where fragmentation is legitimate.
                  emit_incident_v4(ctx, saddr, INCIDENT_UDP_FRAG, now);
-                 if (!is_monitor) return XDP_DROP;
+                 if (!is_monitor) {
+                    count_incident_drop(INCIDENT_UDP_FRAG);
+                    return XDP_DROP;
+                 }
              }
 
              if (is_http3_seen_v4(saddr, now)) {
@@ -984,7 +1021,10 @@ int xdp_filter(struct xdp_md *ctx) {
                      __u8 reason = is_frag ? INCIDENT_UDP_FRAG : INCIDENT_UDP_RATE;
                      emit_incident_v4(ctx, saddr, reason, now);
                  }
-                 if (!is_monitor) return XDP_DROP;
+                 if (!is_monitor) {
+                    count_incident_drop(is_frag ? INCIDENT_UDP_FRAG : INCIDENT_UDP_RATE);
+                    return XDP_DROP;
+                 }
              }
         }
 
@@ -1000,7 +1040,10 @@ int xdp_filter(struct xdp_md *ctx) {
                  info.flags_raw = tcp_flags_raw(tcp);
                  bpf_map_update_elem(&bad_flags, &saddr, &info, BPF_ANY);
                  emit_incident_v4(ctx, saddr, INCIDENT_BAD_FLAGS, now);
-                 if (!is_monitor) return XDP_DROP;
+                 if (!is_monitor) {
+                    count_incident_drop(INCIDENT_BAD_FLAGS);
+                    return XDP_DROP;
+                 }
              }
         }
 
@@ -1034,7 +1077,10 @@ int xdp_filter(struct xdp_md *ctx) {
                     bpf_map_update_elem(&policy_blocks_v6, &saddr, &one, BPF_ANY);
                 }
                 emit_incident_v6(ctx, &saddr, INCIDENT_POLICY_BLOCK, now);
-                if (!is_monitor) return XDP_DROP;
+                if (!is_monitor) {
+                    count_incident_drop(INCIDENT_POLICY_BLOCK);
+                    return XDP_DROP;
+                }
             }
         }
 
@@ -1042,7 +1088,10 @@ int xdp_filter(struct xdp_md *ctx) {
         if (val) {
             __sync_fetch_and_add(val, 1);
             emit_incident_v6(ctx, &saddr, INCIDENT_BLOCKED_IP, now);
-            if (!is_monitor) return XDP_DROP;
+            if (!is_monitor) {
+                count_incident_drop(INCIDENT_BLOCKED_IP);
+                return XDP_DROP;
+            }
         }
 
         // Resolve the true upper-layer protocol behind any IPv6 extension
@@ -1058,7 +1107,10 @@ int xdp_filter(struct xdp_md *ctx) {
             // (drop) rather than fail open, mirroring the deep-VLAN policy
             // above, while honoring monitor/dry-run mode.
             emit_incident_v6(ctx, &saddr, INCIDENT_MALFORMED, now);
-            if (!is_monitor) return XDP_DROP;
+            if (!is_monitor) {
+                count_incident_drop(INCIDENT_MALFORMED);
+                return XDP_DROP;
+            }
             return XDP_PASS;
         }
 
@@ -1073,7 +1125,10 @@ int xdp_filter(struct xdp_md *ctx) {
              if (check_rate_limit(&icmp_rates_v6, &saddr, limit, now, &first_trip)) {
                  if (first_trip)
                      emit_incident_v6(ctx, &saddr, INCIDENT_ICMP_RATE, now);
-                 if (!is_monitor) return XDP_DROP;
+                 if (!is_monitor) {
+                    count_incident_drop(INCIDENT_ICMP_RATE);
+                    return XDP_DROP;
+                 }
              }
         }
 
@@ -1092,7 +1147,10 @@ int xdp_filter(struct xdp_md *ctx) {
              if (check_rate_limit(&udp_rates_v6, &saddr, limit, now, &first_trip)) {
                  if (first_trip)
                      emit_incident_v6(ctx, &saddr, INCIDENT_UDP_RATE, now);
-                 if (!is_monitor) return XDP_DROP;
+                 if (!is_monitor) {
+                    count_incident_drop(INCIDENT_UDP_RATE);
+                    return XDP_DROP;
+                 }
              }
         }
         // IPv6 Fragment extension header. DROP mode keeps the legacy hard drop.
@@ -1101,7 +1159,10 @@ int xdp_filter(struct xdp_md *ctx) {
         if (l4_proto == IP6_EXT_FRAGMENT) {
             if (udp_frag_mode() == UDP_FRAG_MODE_DROP) {
                 emit_incident_v6(ctx, &saddr, INCIDENT_UDP_FRAG, now);
-                if (!is_monitor) return XDP_DROP;
+                if (!is_monitor) {
+                    count_incident_drop(INCIDENT_UDP_FRAG);
+                    return XDP_DROP;
+                }
             } else {
                 struct ip6_frag_hdr *fh = l4_hdr;
                 if ((void *)(fh + 1) <= data_end) {
@@ -1117,7 +1178,10 @@ int xdp_filter(struct xdp_md *ctx) {
                         if (check_rate_limit(&udp_rates_v6, &saddr, limit, now, &first_trip)) {
                             if (first_trip)
                                 emit_incident_v6(ctx, &saddr, INCIDENT_UDP_FRAG, now);
-                            if (!is_monitor) return XDP_DROP;
+                            if (!is_monitor) {
+                                count_incident_drop(INCIDENT_UDP_FRAG);
+                                return XDP_DROP;
+                            }
                         }
                     }
                 }
@@ -1136,7 +1200,10 @@ int xdp_filter(struct xdp_md *ctx) {
                 info.flags_raw = tcp_flags_raw(tcp);
                 bpf_map_update_elem(&bad_flags_v6, &saddr, &info, BPF_ANY);
                 emit_incident_v6(ctx, &saddr, INCIDENT_BAD_FLAGS, now);
-                if (!is_monitor) return XDP_DROP;
+                if (!is_monitor) {
+                    count_incident_drop(INCIDENT_BAD_FLAGS);
+                    return XDP_DROP;
+                }
             }
         }
     }

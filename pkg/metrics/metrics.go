@@ -295,6 +295,14 @@ var (
 		Help: "Structured kernel-space enforcement incidents by reason",
 	}, []string{"reason"})
 
+	// KernelDroppedPacketsExact is the exact packet-drop total from BPF-side
+	// per-reason counters. Unlike KernelIncidents, it does not depend on perf
+	// event delivery, perf budgeting, or userspace log throttling.
+	KernelDroppedPacketsExact = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "packetyeeter_kernel_dropped_packets_total",
+		Help: "Exact kernel-space dropped packets by incident reason",
+	}, []string{"reason"})
+
 	PerfLostSamples = promauto.NewCounterVec(prometheus.CounterOpts{
 		Name: "packetyeeter_perf_lost_samples_total",
 		Help: "Kernel perf-ring samples lost before userspace could read them",

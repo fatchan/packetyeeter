@@ -70,6 +70,7 @@ const (
 	IncidentUDPFrag     = 5
 	IncidentBadFlags    = 6
 	IncidentMalformed   = 7
+	IncidentMax         = 8
 )
 
 // IncidentReasonName returns a human-readable name for an incident reason

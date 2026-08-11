@@ -20,6 +20,7 @@ import (
 	"PacketYeeter/pkg/geoip"
 	"PacketYeeter/pkg/metrics"
 
+	cebpf "github.com/cilium/ebpf"
 	"github.com/cilium/ebpf/perf"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
@@ -123,6 +124,11 @@ type Collector struct {
 	prevICMPRatesV6 map[[16]byte]prevRate
 	prevUDPRatesV6  map[[16]byte]prevRate
 
+	// Previous absolute exact-drop totals read from the BPF per-reason counter
+	// map. Prometheus counters must only move forward, so we diff successive
+	// absolute reads and add only the positive delta.
+	prevIncidentDropCounts map[uint32]uint64
+
 	// Last-alerted timestamps for bad TCP flag scans, so repeated polls
 	// don't re-emit a signal for the same kernel-observed event.
 	prevBadFlagsSeen   map[uint32]uint64
@@ -206,21 +212,22 @@ func New(cfg Config, logger *logrus.Logger) (*Collector, error) {
 	}
 
 	c := &Collector{
-		Config:             cfg,
-		Logger:             logger,
-		reconnectCh:        make(chan struct{}, 1),
-		signalQueue:        make(chan *apiv1.Signal, max(cfg.SignalQueueSize, 10000)), // Ring buffer default 10k
-		synCacheTTL:        60 * time.Second,                                          // TTL for SYN timestamp cache
-		prevICMPRates:      make(map[uint32]prevRate),
-		prevUDPRates:       make(map[uint32]prevRate),
-		prevICMPRatesV6:    make(map[[16]byte]prevRate),
-		prevUDPRatesV6:     make(map[[16]byte]prevRate),
-		prevBadFlagsSeen:   make(map[uint32]uint64),
-		prevBadFlagsSeenV6: make(map[[16]byte]uint64),
-		prevEgressBytes:    make(map[uint32]prevEgress),
-		prevEgressBytesV6:  make(map[[16]byte]prevEgress),
-		dynamicAllowedNets: make(map[string]*net.IPNet),
-		incidentLogState:   make(map[string]*incidentLogThrottleState),
+		Config:                 cfg,
+		Logger:                 logger,
+		reconnectCh:            make(chan struct{}, 1),
+		signalQueue:            make(chan *apiv1.Signal, max(cfg.SignalQueueSize, 10000)), // Ring buffer default 10k
+		synCacheTTL:            60 * time.Second,                                          // TTL for SYN timestamp cache
+		prevICMPRates:          make(map[uint32]prevRate),
+		prevUDPRates:           make(map[uint32]prevRate),
+		prevICMPRatesV6:        make(map[[16]byte]prevRate),
+		prevUDPRatesV6:         make(map[[16]byte]prevRate),
+		prevIncidentDropCounts: make(map[uint32]uint64),
+		prevBadFlagsSeen:       make(map[uint32]uint64),
+		prevBadFlagsSeenV6:     make(map[[16]byte]uint64),
+		prevEgressBytes:        make(map[uint32]prevEgress),
+		prevEgressBytesV6:      make(map[[16]byte]prevEgress),
+		dynamicAllowedNets:     make(map[string]*net.IPNet),
+		incidentLogState:       make(map[string]*incidentLogThrottleState),
 	}
 
 	// Load GeoIP database
@@ -771,6 +778,7 @@ func (c *Collector) pollMaps() {
 			return
 		case <-ticker.C:
 			c.Logger.Debug("Polling eBPF maps for signals")
+			c.syncIncidentDropCounters()
 			c.sendPendingHandshakes()
 			c.sendICMPRates()
 			c.sendUDPRates()
@@ -1009,6 +1017,46 @@ func (c *Collector) processIncidentEvent(data []byte) {
 	metrics.KernelIncidents.WithLabelValues(reason).Inc()
 
 	c.logIncidentThrottled(ip, reason, inc.Timestamp)
+}
+
+// syncIncidentDropCounters reads the exact BPF-side per-reason drop counters
+// and exports positive deltas to Prometheus. This complements the sampled
+// incident perf stream rather than replacing it.
+func (c *Collector) syncIncidentDropCounters() {
+	if c.Maps == nil || c.Maps.IncidentDropCounts == nil {
+		return
+	}
+
+	for reason := uint32(1); reason < uint32(ebpf.IncidentMax); reason++ {
+		total, err := readPerCPUCounter(c.Maps.IncidentDropCounts, reason)
+		if err != nil {
+			c.Logger.WithError(err).WithField("reason", reason).Debug("Failed reading exact incident drop counter")
+			continue
+		}
+
+		prev := c.prevIncidentDropCounts[reason]
+		if total >= prev {
+			delta := total - prev
+			if delta > 0 {
+				metrics.KernelDroppedPacketsExact.WithLabelValues(ebpf.IncidentReasonName(uint8(reason))).Add(float64(delta))
+			}
+		}
+		// If total < prev, the program or map was reloaded/reset. Reset the
+		// baseline without exporting a negative delta.
+		c.prevIncidentDropCounts[reason] = total
+	}
+}
+
+func readPerCPUCounter(m *cebpf.Map, key uint32) (uint64, error) {
+	var values []uint64
+	if err := m.Lookup(&key, &values); err != nil {
+		return 0, err
+	}
+	var total uint64
+	for _, v := range values {
+		total += v
+	}
+	return total, nil
 }
 
 func (c *Collector) storeSynTimestamp(ip net.IP) {
@@ -1997,18 +2045,21 @@ func (c *Collector) emitSignal(signal *apiv1.Signal) {
 	c.sendSignal(signal)
 }
 
-// startCollectorMetricsServer creates a metrics server that only exposes SPOE-related metrics
+// startCollectorMetricsServer creates a metrics server
 func (c *Collector) startCollectorMetricsServer() *http.Server {
-	// Create a custom registry that only includes SPOE handler metrics
 	registry := prometheus.NewRegistry()
 
-	// Register only SPOE handler/queue metrics (not analysis metrics)
-	registry.MustRegister(metrics.SPOEHandlerLatency)
-	registry.MustRegister(metrics.SPOEQueueDepth)
-	registry.MustRegister(metrics.SPOEQueueDrops)
-	registry.MustRegister(metrics.SPOEProcessingLatency)
+	if c.Config.SPOEAddr != "" {
+		registry.MustRegister(metrics.SPOEHandlerLatency)
+		registry.MustRegister(metrics.SPOEQueueDepth)
+		registry.MustRegister(metrics.SPOEQueueDrops)
+		registry.MustRegister(metrics.SPOEProcessingLatency)
+	}
+
 	registry.MustRegister(metrics.KernelIncidents)
+	registry.MustRegister(metrics.KernelDroppedPacketsExact)
 	registry.MustRegister(metrics.PerfLostSamples)
+
 	metrics.PerfLostSamples.WithLabelValues("tcp_metadata").Add(0)
 	metrics.PerfLostSamples.WithLabelValues("incidents").Add(0)
 

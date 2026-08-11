@@ -94,6 +94,7 @@ func (l *Loader) Load() error {
 		PolicyBlocksV6:      l.coll.Maps["policy_blocks_v6"],
 		Events:              l.coll.Maps["events"],
 		Incidents:           l.coll.Maps["incidents"],
+		IncidentDropCounts:  l.coll.Maps["incident_drop_counts"],
 		EgressBytes:         l.coll.Maps["egress_bytes"],
 		EgressBytesV6:       l.coll.Maps["egress_bytes_v6"],
 	}
