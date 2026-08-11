@@ -200,6 +200,7 @@ func normalizeInterfaces(primary string, interfaces []string) []string {
 func New(cfg Config, logger *logrus.Logger) (*Collector, error) {
 	cfg.Interfaces = normalizeInterfaces(cfg.Interface, cfg.Interfaces)
 	cfg.AnalyzerAddr = strings.TrimSpace(cfg.AnalyzerAddr)
+	cfg.SPOEAddr = strings.TrimSpace(cfg.SPOEAddr)
 	if len(cfg.Interfaces) == 0 {
 		return nil, fmt.Errorf("no interfaces configured")
 	}
@@ -402,16 +403,25 @@ func (c *Collector) Start(ctx context.Context) error {
 	c.wg.Add(1)
 	go c.signalSender()
 
-	// Start SPOE agent with callbacks
-	spoeAddr := c.Config.SPOEAddr
-	if spoeAddr == "" {
-		spoeAddr = ":9876"
+	if c.Config.SPOEAddr != "" {
+		// Start SPOE agent with callbacks
+		c.spoeAgent = spoe.NewCollectorAgent(c.Config.SPOEAddr, c.checkAllowlist, spoe.CollectorCallbacks{
+			EmitSignal:      c.emitSignal,
+			GetSynTimestamp: c.getSynTimestamp, // Pass SYN lookup function
+			QueueLen:        func() int { return len(c.signalQueue) },
+		})
+
+		// Start SPOE
+		c.wg.Add(1)
+		go func() {
+			defer c.wg.Done()
+			if err := c.spoeAgent.Start(); err != nil {
+				c.Logger.WithError(err).Error("SPOE agent error")
+			}
+		}()
+	} else {
+		c.Logger.Info("No SPOE address configured; SPOE disabled")
 	}
-	c.spoeAgent = spoe.NewCollectorAgent(spoeAddr, c.checkAllowlist, spoe.CollectorCallbacks{
-		EmitSignal:      c.emitSignal,
-		GetSynTimestamp: c.getSynTimestamp, // Pass SYN lookup function
-		QueueLen:        func() int { return len(c.signalQueue) },
-	})
 
 	// Start map poller (streams raw events to analyzer)
 	c.wg.Add(1)
@@ -420,15 +430,6 @@ func (c *Collector) Start(ctx context.Context) error {
 	// Start SYN cache cleanup
 	c.wg.Add(1)
 	go c.cleanupSynCache()
-
-	// Start SPOE
-	c.wg.Add(1)
-	go func() {
-		defer c.wg.Done()
-		if err := c.spoeAgent.Start(); err != nil {
-			c.Logger.WithError(err).Error("SPOE agent error")
-		}
-	}()
 
 	// Start block GC (cleanup expired blocks)
 	c.wg.Add(1)

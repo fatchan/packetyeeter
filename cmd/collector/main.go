@@ -20,10 +20,10 @@ func main() {
 	var (
 		iface                      = flag.String("i", "eth0", "Network interface(s) to attach to; accepts a single interface or a comma-separated list like eth0,eth1")
 		interfaces                 = flag.String("interfaces", "", "Explicit comma-separated list of network interfaces to attach to, e.g. eth0,eth1,eth2")
-		analyzerAddr               = flag.String("analyzer-addr", "127.0.0.1:9090", "Analyzer gRPC address")
+		analyzerAddr               = flag.String("analyzer-addr", "", "Analyzer gRPC address")
 		metricsAddr                = flag.String("metrics-addr", ":2112", "Prometheus metrics HTTP listen address")
 		haproxyPort                = flag.Int("haproxy-port", 8765, "HAProxy peer protocol port")
-		spoePort                   = flag.Int("spoe-port", 9876, "SPOE agent port")
+		spoePort                   = flag.Int("spoe-port", 0, "SPOE agent port (0 disables SPOE)")
 		socketPath                 = flag.String("socket", "/var/run/packetyeeter-collector.sock", "Unix socket for CLI")
 		geoIPASNPath               = flag.String("geoip-asn", "", "Path to GeoLite2-ASN.mmdb")
 		allowlist                  = flag.String("allowlist", "", "Comma-separated CIDRs to allowlist (e.g., 10.0.0.0/8,192.168.1.0/24)")
@@ -65,12 +65,17 @@ func main() {
 		logrus.WithError(err).Fatal("Invalid -udp-frag-mode")
 	}
 
+	spoeAddr := ""
+	if *spoePort > 0 {
+		spoeAddr = fmt.Sprintf(":%d", *spoePort)
+	}
+
 	cfg := collector.Config{
 		Interface:                  *iface,
 		Interfaces:                 []string{*interfaces},
 		AnalyzerAddr:               *analyzerAddr,
 		MetricsAddr:                *metricsAddr,
-		SPOEAddr:                   fmt.Sprintf(":%d", *spoePort),
+		SPOEAddr:                   spoeAddr,
 		HAProxyPort:                *haproxyPort,
 		SocketPath:                 *socketPath,
 		GeoIPASNPath:               *geoIPASNPath,
