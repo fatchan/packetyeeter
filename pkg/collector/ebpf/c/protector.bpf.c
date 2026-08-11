@@ -1040,6 +1040,7 @@ int xdp_filter(struct xdp_md *ctx) {
 
         __u64 *val = bpf_map_lookup_elem(&blocked_ips_v6, &saddr);
         if (val) {
+            __sync_fetch_and_add(val, 1);
             emit_incident_v6(ctx, &saddr, INCIDENT_BLOCKED_IP, now);
             if (!is_monitor) return XDP_DROP;
         }

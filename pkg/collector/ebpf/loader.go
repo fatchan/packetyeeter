@@ -7,6 +7,7 @@ import (
 	"embed"
 	"fmt"
 	"net"
+	"strings"
 
 	"github.com/cilium/ebpf"
 	"github.com/cilium/ebpf/link"
@@ -17,20 +18,41 @@ import (
 //go:embed c/protector.bpf.*
 var bpfFS embed.FS
 
-type Loader struct {
-	coll  *ebpf.Collection
-	maps  *Maps
-	links []link.Link // XDP
-	iface string
-
-	// TC Filter objects
-	ingressFilter *netlink.BpfFilter
-	egressFilter  *netlink.BpfFilter
+type tcAttachment struct {
+	ifaceName      string
+	ifaceIndex     int
+	ingressFilter  *netlink.BpfFilter
+	egressFilter   *netlink.BpfFilter
 }
 
-func NewLoader(iface string) *Loader {
+type Loader struct {
+	coll       *ebpf.Collection
+	maps       *Maps
+	links      []link.Link
+	interfaces []string
+	tcFilters  []tcAttachment
+}
+
+func normalizeInterfaces(interfaces []string) []string {
+	seen := make(map[string]struct{}, len(interfaces))
+	out := make([]string, 0, len(interfaces))
+	for _, iface := range interfaces {
+		iface = strings.TrimSpace(iface)
+		if iface == "" {
+			continue
+		}
+		if _, ok := seen[iface]; ok {
+			continue
+		}
+		seen[iface] = struct{}{}
+		out = append(out, iface)
+	}
+	return out
+}
+
+func NewLoader(interfaces []string) *Loader {
 	return &Loader{
-		iface: iface,
+		interfaces: normalizeInterfaces(interfaces),
 	}
 }
 
@@ -80,80 +102,107 @@ func (l *Loader) Load() error {
 }
 
 func (l *Loader) Attach() error {
-	iface, err := net.InterfaceByName(l.iface)
-	if err != nil {
-		return fmt.Errorf("interface %s not found: %w", l.iface, err)
+	if len(l.interfaces) == 0 {
+		return fmt.Errorf("no interfaces configured")
 	}
 
-	// 1. Attach XDP
 	xdpProg := l.coll.Programs["xdp_filter"]
-	xdpLink, err := link.AttachXDP(link.XDPOptions{
-		Program:   xdpProg,
-		Interface: iface.Index,
-	})
-	if err != nil {
-		return fmt.Errorf("failed to attach XDP: %w", err)
-	}
-	l.links = append(l.links, xdpLink)
-
-	// 2. Attach TC
-	qdisc := &netlink.GenericQdisc{
-		QdiscAttrs: netlink.QdiscAttrs{
-			LinkIndex: iface.Index,
-			Handle:    netlink.MakeHandle(0xffff, 0),
-			Parent:    netlink.HANDLE_CLSACT,
-		},
-		QdiscType: "clsact",
-	}
-	netlink.QdiscAdd(qdisc) // Ignore error
-
-	// Ingress
 	ingressProg := l.coll.Programs["tc_ingress_syn_monitor"]
-	l.ingressFilter = &netlink.BpfFilter{
-		FilterAttrs: netlink.FilterAttrs{
-			LinkIndex: iface.Index,
-			Parent:    netlink.MakeHandle(0xffff, 0xfff2),
-			Protocol:  unix.ETH_P_ALL,
-			Priority:  1,
-		},
-		Fd:           ingressProg.FD(),
-		Name:         "tc_ingress_syn_monitor",
-		DirectAction: true,
-	}
-	if err := netlink.FilterAdd(l.ingressFilter); err != nil {
-		return fmt.Errorf("failed to attach TC Ingress: %w", err)
-	}
-
-	// Egress
 	egressProg := l.coll.Programs["tc_egress_synack_monitor"]
-	l.egressFilter = &netlink.BpfFilter{
-		FilterAttrs: netlink.FilterAttrs{
-			LinkIndex: iface.Index,
-			Parent:    netlink.MakeHandle(0xffff, 0xfff3),
-			Protocol:  unix.ETH_P_ALL,
-			Priority:  1,
-		},
-		Fd:           egressProg.FD(),
-		Name:         "tc_egress_synack_monitor",
-		DirectAction: true,
-	}
-	if err := netlink.FilterAdd(l.egressFilter); err != nil {
-		return fmt.Errorf("failed to attach TC Egress: %w", err)
+
+	for _, ifaceName := range l.interfaces {
+		iface, err := net.InterfaceByName(ifaceName)
+		if err != nil {
+			l.closeAttachments()
+			return fmt.Errorf("interface %s not found: %w", ifaceName, err)
+		}
+
+		xdpLink, err := link.AttachXDP(link.XDPOptions{
+			Program:   xdpProg,
+			Interface: iface.Index,
+		})
+		if err != nil {
+			l.closeAttachments()
+			return fmt.Errorf("failed to attach XDP to %s: %w", ifaceName, err)
+		}
+		l.links = append(l.links, xdpLink)
+
+		qdisc := &netlink.GenericQdisc{
+			QdiscAttrs: netlink.QdiscAttrs{
+				LinkIndex: iface.Index,
+				Handle:    netlink.MakeHandle(0xffff, 0),
+				Parent:    netlink.HANDLE_CLSACT,
+			},
+			QdiscType: "clsact",
+		}
+		netlink.QdiscAdd(qdisc)
+
+		attachment := tcAttachment{
+			ifaceName:  ifaceName,
+			ifaceIndex: iface.Index,
+		}
+
+		attachment.ingressFilter = &netlink.BpfFilter{
+			FilterAttrs: netlink.FilterAttrs{
+				LinkIndex: iface.Index,
+				Parent:    netlink.MakeHandle(0xffff, 0xfff2),
+				Protocol:  unix.ETH_P_ALL,
+				Priority:  1,
+			},
+			Fd:           ingressProg.FD(),
+			Name:         "tc_ingress_syn_monitor",
+			DirectAction: true,
+		}
+		if err := netlink.FilterAdd(attachment.ingressFilter); err != nil {
+			xdpLink.Close()
+			l.links = l.links[:len(l.links)-1]
+			l.closeAttachments()
+			return fmt.Errorf("failed to attach TC Ingress to %s: %w", ifaceName, err)
+		}
+
+		attachment.egressFilter = &netlink.BpfFilter{
+			FilterAttrs: netlink.FilterAttrs{
+				LinkIndex: iface.Index,
+				Parent:    netlink.MakeHandle(0xffff, 0xfff3),
+				Protocol:  unix.ETH_P_ALL,
+				Priority:  1,
+			},
+			Fd:           egressProg.FD(),
+			Name:         "tc_egress_synack_monitor",
+			DirectAction: true,
+		}
+		if err := netlink.FilterAdd(attachment.egressFilter); err != nil {
+			netlink.FilterDel(attachment.ingressFilter)
+			xdpLink.Close()
+			l.links = l.links[:len(l.links)-1]
+			l.closeAttachments()
+			return fmt.Errorf("failed to attach TC Egress to %s: %w", ifaceName, err)
+		}
+
+		l.tcFilters = append(l.tcFilters, attachment)
 	}
 
 	return nil
 }
 
+func (l *Loader) closeAttachments() {
+	for i := len(l.tcFilters) - 1; i >= 0; i-- {
+		if l.tcFilters[i].ingressFilter != nil {
+			netlink.FilterDel(l.tcFilters[i].ingressFilter)
+		}
+		if l.tcFilters[i].egressFilter != nil {
+			netlink.FilterDel(l.tcFilters[i].egressFilter)
+		}
+	}
+	l.tcFilters = nil
+	for i := len(l.links) - 1; i >= 0; i-- {
+		l.links[i].Close()
+	}
+	l.links = nil
+}
+
 func (l *Loader) Close() {
-	if l.ingressFilter != nil {
-		netlink.FilterDel(l.ingressFilter)
-	}
-	if l.egressFilter != nil {
-		netlink.FilterDel(l.egressFilter)
-	}
-	for _, lnk := range l.links {
-		lnk.Close()
-	}
+	l.closeAttachments()
 	if l.coll != nil {
 		l.coll.Close()
 	}

@@ -34,6 +34,7 @@ import (
 // Config holds collector configuration
 type Config struct {
 	Interface                  string
+	Interfaces                 []string
 	AnalyzerAddr               string
 	MetricsAddr                string
 	SPOEAddr                   string // e.g., ":9876"
@@ -168,7 +169,40 @@ func max(a, b int) int {
 	return b
 }
 
+func normalizeInterfaces(primary string, interfaces []string) []string {
+	seen := make(map[string]struct{})
+	out := make([]string, 0, len(interfaces)+1)
+	for _, iface := range interfaces {
+		iface = strings.TrimSpace(iface)
+		if iface == "" {
+			continue
+		}
+		if _, ok := seen[iface]; ok {
+			continue
+		}
+		seen[iface] = struct{}{}
+		out = append(out, iface)
+	}
+	for _, iface := range strings.Split(primary, ",") {
+		iface = strings.TrimSpace(iface)
+		if iface == "" {
+			continue
+		}
+		if _, ok := seen[iface]; ok {
+			continue
+		}
+		seen[iface] = struct{}{}
+		out = append(out, iface)
+	}
+	return out
+}
+
 func New(cfg Config, logger *logrus.Logger) (*Collector, error) {
+	cfg.Interfaces = normalizeInterfaces(cfg.Interface, cfg.Interfaces)
+	if len(cfg.Interfaces) == 0 {
+		return nil, fmt.Errorf("no interfaces configured")
+	}
+
 	c := &Collector{
 		Config:             cfg,
 		Logger:             logger,
@@ -233,8 +267,8 @@ func (c *Collector) Start(ctx context.Context) error {
 	c.checkKernelSynCookies()
 
 	// Load eBPF programs
-	c.Logger.Info("Loading eBPF programs...")
-	c.Loader = ebpf.NewLoader(c.Config.Interface)
+	c.Logger.WithField("interfaces", c.Config.Interfaces).Info("Loading eBPF programs...")
+	c.Loader = ebpf.NewLoader(c.Config.Interfaces)
 	if err := c.Loader.Load(); err != nil {
 		return fmt.Errorf("failed to load eBPF: %w", err)
 	}
@@ -242,7 +276,7 @@ func (c *Collector) Start(ctx context.Context) error {
 		return fmt.Errorf("failed to attach eBPF: %w", err)
 	}
 	c.Maps = c.Loader.GetMaps()
-	c.Logger.Info("eBPF programs loaded and attached")
+	c.Logger.WithField("interfaces", c.Config.Interfaces).Info("eBPF programs loaded and attached")
 
 	if err := c.Maps.SetICMPThreshold(c.Config.ICMPThreshold); err != nil {
 		c.Logger.WithError(err).Warn("Failed to configure kernel/XDP ICMP threshold; BPF default may still apply")
@@ -407,6 +441,7 @@ func (c *Collector) Start(ctx context.Context) error {
 	}()
 
 	c.Logger.WithFields(logrus.Fields{
+		"interfaces":                c.Config.Interfaces,
 		"icmp_signal_threshold_pps": effectiveSignalThreshold(c.Config.ICMPSignalThreshold),
 		"udp_signal_threshold_pps":  effectiveSignalThreshold(c.Config.UDPSignalThreshold),
 		"http3_seen_ttl":            c.Config.HTTP3SeenTTL,

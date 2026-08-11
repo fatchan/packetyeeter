@@ -18,7 +18,8 @@ import (
 
 func main() {
 	var (
-		iface                      = flag.String("i", "eth0", "Network interface to attach to")
+		iface                      = flag.String("i", "eth0", "Network interface(s) to attach to; accepts a single interface or a comma-separated list like eth0,eth1")
+		interfaces                 = flag.String("interfaces", "", "Explicit comma-separated list of network interfaces to attach to, e.g. eth0,eth1,eth2")
 		analyzerAddr               = flag.String("analyzer-addr", "127.0.0.1:9090", "Analyzer gRPC address")
 		metricsAddr                = flag.String("metrics-addr", ":2112", "Prometheus metrics HTTP listen address")
 		haproxyPort                = flag.Int("haproxy-port", 8765, "HAProxy peer protocol port")
@@ -66,6 +67,7 @@ func main() {
 
 	cfg := collector.Config{
 		Interface:                  *iface,
+		Interfaces:                 []string{*interfaces},
 		AnalyzerAddr:               *analyzerAddr,
 		MetricsAddr:                *metricsAddr,
 		SPOEAddr:                   fmt.Sprintf(":%d", *spoePort),
@@ -98,7 +100,6 @@ func main() {
 		logger.WithError(err).Fatal("Failed to create collector")
 	}
 
-	// Create context for graceful shutdown
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
@@ -106,9 +107,11 @@ func main() {
 		logger.WithError(err).Fatal("Failed to start collector")
 	}
 
-	logger.Info("PacketYeeter Collector started - relaying to analyzer at ", *analyzerAddr)
+	logger.WithFields(logrus.Fields{
+		"analyzer":   *analyzerAddr,
+		"interfaces": coll.Config.Interfaces,
+	}).Info("PacketYeeter Collector started")
 
-	// Wait for shutdown signal
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
 	<-sigChan
@@ -116,7 +119,6 @@ func main() {
 	logger.Info("Shutting down collector...")
 	cancel()
 
-	// Stop with timeout - SPOE library doesn't gracefully handle active connections
 	done := make(chan struct{})
 	go func() {
 		coll.Stop()
