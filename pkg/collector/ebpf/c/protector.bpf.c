@@ -12,17 +12,21 @@
 #include <bpf/bpf_helpers.h>
 #include <bpf/bpf_endian.h>
 
+
 // --- Configuration ---
-// Increased map sizes for handling large-scale DDoS
-#define BLOCK_MAP_SIZE 3000000
-#define HANDSHAKES_MAP_SIZE 500000
+// General-purpose LRU maps sized for a realistic active working set.
+#define GENERAL_MAP_MAX_ENTRIES 500000
 // Bad-flags scanners tracked for telemetry. LRU so a spoofed-source scan flood
 // evicts the oldest entry instead of failing inserts (E2BIG) once full, which
 // would otherwise blind the userspace signal pipeline to every new scanner.
-#define BADFLAGS_MAP_SIZE 100000
-// Clients tracked for egress byte accounting. LRU, so the coldest client is
-// evicted under high cardinality instead of insertions failing.
-#define EGRESS_MAP_SIZE 200000
+#define BADFLAGS_MAP_SIZE 50000
+// Counts packets dropped by explicit policy rules, keyed by source IP.
+#define POLICY_BLOCKS_MAP_SIZE 4096
+#define ALLOWLIST_MAP_SIZE 1024
+#define POLICY_MAP_SIZE 1024
+#define CONFIG_MAP_SIZE 5
+#define INCIDENT_DROP_COUNTS_SIZE 8
+#define BUDGET_MAP_SIZE 1
 
 // IPv6 extension-header next-header values, and the cap on how many we walk
 // before giving up. A packet's real L4 protocol can hide behind these; without
@@ -151,70 +155,70 @@ struct lpm_key_v6 {
 // This ensures we never stop blocking NEW attackers just because the map is full.
 struct {
     __uint(type, BPF_MAP_TYPE_LRU_HASH);
-    __uint(max_entries, BLOCK_MAP_SIZE);
+    __uint(max_entries, GENERAL_MAP_MAX_ENTRIES);
     __type(key, __u32);
     __type(value, __u64);
 } blocked_ips SEC(".maps");
 
 struct {
     __uint(type, BPF_MAP_TYPE_LRU_HASH);
-    __uint(max_entries, BLOCK_MAP_SIZE);
+    __uint(max_entries, GENERAL_MAP_MAX_ENTRIES);
     __type(key, struct in6_addr);
     __type(value, __u64);
 } blocked_ips_v6 SEC(".maps");
 
 struct {
     __uint(type, BPF_MAP_TYPE_LRU_HASH);
-    __uint(max_entries, HANDSHAKES_MAP_SIZE);
+    __uint(max_entries, GENERAL_MAP_MAX_ENTRIES);
     __type(key, struct tcp_session_key);
     __type(value, struct handshake_status);
 } pending_handshakes SEC(".maps");
 
 struct {
     __uint(type, BPF_MAP_TYPE_LRU_HASH);
-    __uint(max_entries, HANDSHAKES_MAP_SIZE);
+    __uint(max_entries, GENERAL_MAP_MAX_ENTRIES);
     __type(key, struct tcp_session_key_v6);
     __type(value, struct handshake_status);
 } pending_handshakes_v6 SEC(".maps");
 
 struct {
     __uint(type, BPF_MAP_TYPE_LRU_HASH);
-    __uint(max_entries, BLOCK_MAP_SIZE);
+    __uint(max_entries, GENERAL_MAP_MAX_ENTRIES);
     __type(key, __u32);
     __type(value, struct rate_limit);
 } icmp_rates SEC(".maps");
 
 struct {
     __uint(type, BPF_MAP_TYPE_LRU_HASH);
-    __uint(max_entries, BLOCK_MAP_SIZE);
+    __uint(max_entries, GENERAL_MAP_MAX_ENTRIES);
     __type(key, struct in6_addr);
     __type(value, struct rate_limit);
 } icmp_rates_v6 SEC(".maps");
 
 struct {
     __uint(type, BPF_MAP_TYPE_LRU_HASH);
-    __uint(max_entries, BLOCK_MAP_SIZE);
+    __uint(max_entries, GENERAL_MAP_MAX_ENTRIES);
     __type(key, __u32);
     __type(value, __u64);
 } http3_seen_ips SEC(".maps");
 
 struct {
     __uint(type, BPF_MAP_TYPE_LRU_HASH);
-    __uint(max_entries, BLOCK_MAP_SIZE);
+    __uint(max_entries, GENERAL_MAP_MAX_ENTRIES);
     __type(key, struct in6_addr);
     __type(value, __u64);
 } http3_seen_ips_v6 SEC(".maps");
 
 struct {
     __uint(type, BPF_MAP_TYPE_LRU_HASH);
-    __uint(max_entries, BLOCK_MAP_SIZE);
+    __uint(max_entries, GENERAL_MAP_MAX_ENTRIES);
     __type(key, __u32);
     __type(value, struct rate_limit);
 } udp_rates SEC(".maps");
 
 struct {
     __uint(type, BPF_MAP_TYPE_LRU_HASH);
-    __uint(max_entries, BLOCK_MAP_SIZE);
+    __uint(max_entries, GENERAL_MAP_MAX_ENTRIES);
     __type(key, struct in6_addr);
     __type(value, struct rate_limit);
 } udp_rates_v6 SEC(".maps");
@@ -302,14 +306,14 @@ struct {
 // entry looks like a counter reset to userspace, which is handled there.
 struct {
     __uint(type, BPF_MAP_TYPE_LRU_HASH);
-    __uint(max_entries, EGRESS_MAP_SIZE);
+    __uint(max_entries, GENERAL_MAP_MAX_ENTRIES);
     __type(key, __u32);
     __type(value, __u64);
 } egress_bytes SEC(".maps");
 
 struct {
     __uint(type, BPF_MAP_TYPE_LRU_HASH);
-    __uint(max_entries, EGRESS_MAP_SIZE);
+    __uint(max_entries, GENERAL_MAP_MAX_ENTRIES);
     __type(key, struct in6_addr);
     __type(value, __u64);
 } egress_bytes_v6 SEC(".maps");
