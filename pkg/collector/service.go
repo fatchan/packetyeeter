@@ -442,12 +442,12 @@ func (c *Collector) Start(ctx context.Context) error {
 	c.wg.Add(1)
 	go c.runBlockGC()
 
-	// Start metrics endpoint (SPOE metrics only)
+	// Start metrics endpoint
 	c.metricsServer = c.startCollectorMetricsServer()
 	c.wg.Add(1)
 	go func() {
 		defer c.wg.Done()
-		c.Logger.WithField("addr", c.Config.MetricsAddr).Info("Starting metrics server (SPOE metrics only)")
+		c.Logger.WithField("addr", c.Config.MetricsAddr).Info("Starting collector metrics server")
 		if err := c.metricsServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			c.Logger.WithError(err).Error("Metrics server error")
 		}
