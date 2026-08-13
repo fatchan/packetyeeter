@@ -73,6 +73,12 @@ struct handshake_status {
     __u8 pad[7];
 };
 
+struct incomplete_handshake_count {
+    __u32 count;
+    __u32 pad;
+    __u64 last_updated;
+};
+
 struct rate_limit {
     __u64 last_time;
     __u64 count;
@@ -180,6 +186,20 @@ struct {
     __type(key, struct tcp_session_key_v6);
     __type(value, struct handshake_status);
 } pending_handshakes_v6 SEC(".maps");
+
+struct {
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);
+    __uint(max_entries, GENERAL_MAP_MAX_ENTRIES);
+    __type(key, __u32);
+    __type(value, struct incomplete_handshake_count);
+} incomplete_handshake_counts SEC(".maps");
+
+struct {
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);
+    __uint(max_entries, GENERAL_MAP_MAX_ENTRIES);
+    __type(key, struct in6_addr);
+    __type(value, struct incomplete_handshake_count);
+} incomplete_handshake_counts_v6 SEC(".maps");
 
 struct {
     __uint(type, BPF_MAP_TYPE_LRU_HASH);
@@ -393,6 +413,60 @@ static __always_inline void count_incident_drop(__u8 reason) {
     cnt = bpf_map_lookup_elem(&incident_drop_counts, &key);
     if (cnt)
         (*cnt)++;
+}
+
+static __always_inline void increment_incomplete_handshake_count_v4(__u32 saddr, __u64 now) {
+    struct incomplete_handshake_count *entry = bpf_map_lookup_elem(&incomplete_handshake_counts, &saddr);
+    if (entry) {
+        __sync_fetch_and_add(&entry->count, 1);
+        entry->last_updated = now;
+        return;
+    }
+    struct incomplete_handshake_count new_entry = {
+        .count = 1,
+        .pad = 0,
+        .last_updated = now,
+    };
+    bpf_map_update_elem(&incomplete_handshake_counts, &saddr, &new_entry, BPF_ANY);
+}
+
+static __always_inline void increment_incomplete_handshake_count_v6(struct in6_addr *saddr, __u64 now) {
+    struct incomplete_handshake_count *entry = bpf_map_lookup_elem(&incomplete_handshake_counts_v6, saddr);
+    if (entry) {
+        __sync_fetch_and_add(&entry->count, 1);
+        entry->last_updated = now;
+        return;
+    }
+    struct incomplete_handshake_count new_entry = {
+        .count = 1,
+        .pad = 0,
+        .last_updated = now,
+    };
+    bpf_map_update_elem(&incomplete_handshake_counts_v6, saddr, &new_entry, BPF_ANY);
+}
+
+static __always_inline void decrement_incomplete_handshake_count_v4(__u32 saddr, __u64 now) {
+    struct incomplete_handshake_count *entry = bpf_map_lookup_elem(&incomplete_handshake_counts, &saddr);
+    if (!entry)
+        return;
+    if (entry->count <= 1) {
+        bpf_map_delete_elem(&incomplete_handshake_counts, &saddr);
+        return;
+    }
+    __sync_fetch_and_add(&entry->count, -1);
+    entry->last_updated = now;
+}
+
+static __always_inline void decrement_incomplete_handshake_count_v6(struct in6_addr *saddr, __u64 now) {
+    struct incomplete_handshake_count *entry = bpf_map_lookup_elem(&incomplete_handshake_counts_v6, saddr);
+    if (!entry)
+        return;
+    if (entry->count <= 1) {
+        bpf_map_delete_elem(&incomplete_handshake_counts_v6, saddr);
+        return;
+    }
+    __sync_fetch_and_add(&entry->count, -1);
+    entry->last_updated = now;
 }
 
 // Check rate limit. Returns 1 if limit exceeded (block), 0 if OK.
@@ -1303,13 +1377,14 @@ int tc_ingress_syn_monitor(struct __sk_buff *skb) {
             if (emit_allowed(&event_budget, bpf_ktime_get_ns()))
                 bpf_perf_event_output(skb, &events, flags, &meta, sizeof(meta));
 
-
+            __u64 now = bpf_ktime_get_ns();
             struct handshake_status *existing = bpf_map_lookup_elem(&pending_handshakes, &key);
             if (!existing) {
                 struct handshake_status status = {};
-                status.begin_time = bpf_ktime_get_ns();
+                status.begin_time = now;
                 status.synack_sent = 0;
                 bpf_map_update_elem(&pending_handshakes, &key, &status, BPF_ANY);
+                increment_incomplete_handshake_count_v4(key.saddr, now);
             }
         }
         else if (tcp->ack && !tcp->syn) {
@@ -1339,7 +1414,9 @@ int tc_ingress_syn_monitor(struct __sk_buff *skb) {
                          bpf_perf_event_output(skb, &events, BPF_F_CURRENT_CPU, &meta, sizeof(meta));
                      }
                 }
+                __u64 now = bpf_ktime_get_ns();
                 bpf_map_delete_elem(&pending_handshakes, &key);
+                decrement_incomplete_handshake_count_v4(key.saddr, now);
             }
         }
     } else if (eth->h_proto == bpf_htons(ETH_P_IPV6)) {
@@ -1408,12 +1485,14 @@ int tc_ingress_syn_monitor(struct __sk_buff *skb) {
             if (emit_allowed(&event_budget, bpf_ktime_get_ns()))
                 bpf_perf_event_output(skb, &events, flags, &meta, sizeof(meta));
 
+            __u64 now = bpf_ktime_get_ns();
             struct handshake_status *existing = bpf_map_lookup_elem(&pending_handshakes_v6, &key);
             if (!existing) {
                 struct handshake_status status = {};
-                status.begin_time = bpf_ktime_get_ns();
+                status.begin_time = now;
                 status.synack_sent = 0;
                 bpf_map_update_elem(&pending_handshakes_v6, &key, &status, BPF_ANY);
+                increment_incomplete_handshake_count_v6(&key.saddr, now);
             }
         }
         else if (tcp->ack && !tcp->syn) {
@@ -1443,7 +1522,9 @@ int tc_ingress_syn_monitor(struct __sk_buff *skb) {
                          bpf_perf_event_output(skb, &events, BPF_F_CURRENT_CPU, &meta, sizeof(meta));
                      }
                 }
+                __u64 now = bpf_ktime_get_ns();
                 bpf_map_delete_elem(&pending_handshakes_v6, &key);
+                decrement_incomplete_handshake_count_v6(&key.saddr, now);
             }
         }
     }

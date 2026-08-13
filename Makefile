@@ -57,7 +57,7 @@ test:
 
 # Run portable tests that do not require Linux eBPF support.
 portable-test:
-	$(GO) test -v ./pkg/integration_test ./pkg/collector ./cmd/yeetctl ./cmd/yeetexplorer
+	$(GO) test -v ./pkg/integration_test ./pkg/collector ./cmd/yeetctl
 
 # Run end-to-end tests that spawn a real haproxy binary to validate the
 # collector's SPOE agent against actual haproxy wire behavior. Requires
@@ -108,9 +108,8 @@ dist-binaries: bpf
 	GOOS=linux GOARCH=amd64 $(GO) build -ldflags="$(LDFLAGS)" -o $(DIST_DIR)/packetyeeter-collector-linux-amd64 ./cmd/collector
 	for arch in amd64 arm64; do \
 		GOOS=linux GOARCH=$$arch CGO_ENABLED=0 $(GO) build -ldflags="$(LDFLAGS)" -o $(DIST_DIR)/yeetctl-linux-$$arch ./cmd/yeetctl; \
-		GOOS=linux GOARCH=$$arch CGO_ENABLED=0 $(GO) build -ldflags="$(LDFLAGS)" -o $(DIST_DIR)/yeetexplorer-linux-$$arch ./cmd/yeetexplorer; \
 	done
-	cd $(DIST_DIR) && sha256sum packetyeeter-* yeetctl-* yeetexplorer-* > SHA256SUMS
+	cd $(DIST_DIR) && sha256sum packetyeeter-* yeetctl-* > SHA256SUMS
 
 # Build the collector .deb package (amd64 only). Requires the binary to be
 # built natively at the repo root first and nfpm installed (`make install-nfpm`).

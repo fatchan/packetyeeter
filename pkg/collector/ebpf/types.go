@@ -22,6 +22,16 @@ type HandshakeStatusGeneric struct {
 	Pad        [7]uint8
 }
 
+// IncompleteHandshakeCount mirrors struct incomplete_handshake_count in
+// protector.bpf.c. It stores both the derived per-source incomplete handshake
+// count and the last update time so userspace can prune stale/drifted entries
+// by TTL instead of relying only on count reaching zero.
+type IncompleteHandshakeCount struct {
+	Count       uint32
+	Pad         uint32
+	LastUpdated uint64
+}
+
 // ICMPRate mirrors struct rate_limit in protector.bpf.c (also used for UDP
 // rate maps). Keep layout in sync, including the incident_emitted edge flag.
 type ICMPRate struct {

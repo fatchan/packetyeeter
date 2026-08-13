@@ -25,6 +25,8 @@ import (
 	"golang.org/x/sys/unix"
 )
 
+const incompleteHandshakeBlockReason = "Incomplete Handshake Flood"
+
 // Config holds collector configuration
 type Config struct {
 	Interface                    string
@@ -672,7 +674,11 @@ func (c *Collector) cleanupSynCache() {
 	}
 }
 
-const pendingHandshakeTimeout = 3 * time.Second
+// pendingHandshakeTimeout is the collector-side recentness window for deciding
+// whether a handshake is still incomplete enough to matter. A source must reach
+// the configured threshold within this rolling recent window before the
+// collector-side incomplete-handshake autoblock path will fire.
+const pendingHandshakeTimeout = 30 * time.Second
 
 func monotonicNowNS() (uint64, error) {
 	var ts unix.Timespec
@@ -708,13 +714,14 @@ func (c *Collector) refreshPendingHandshakes() {
 		var val ebpf.HandshakeStatusGeneric
 		iter := c.Maps.PendingHandshakes.Iterate()
 		for iter.Next(&key, &val) {
+			// Stale entries are removed first so the block threshold applies only to
+			// recent incomplete handshakes, not to long-dead residual state.
 			if pendingHandshakeExpired(nowNS, val.BeginTime) {
-				if err := c.Maps.PendingHandshakes.Delete(&key); err != nil {
+				if err := c.removePendingHandshakeIPv4(key); err != nil {
 					c.Logger.WithError(err).Debug("Failed to prune expired IPv4 pending handshake")
 				}
 				continue
 			}
-			c.maybeBlockIncompleteHandshakeIPv4(nowNS, key, val)
 		}
 		if err := iter.Err(); err != nil {
 			c.Logger.WithError(err).Warn("Failed to iterate IPv4 pending handshakes")
@@ -726,98 +733,258 @@ func (c *Collector) refreshPendingHandshakes() {
 		var val ebpf.HandshakeStatusGeneric
 		iter := c.Maps.PendingHandshakesV6.Iterate()
 		for iter.Next(&key, &val) {
+			// Same logic as IPv4: only recent incomplete handshakes should count
+			// toward autoblocking, and stale entries should be removed opportunistically.
 			if pendingHandshakeExpired(nowNS, val.BeginTime) {
-				if err := c.Maps.PendingHandshakesV6.Delete(&key); err != nil {
+				if err := c.removePendingHandshakeIPv6(key); err != nil {
 					c.Logger.WithError(err).Debug("Failed to prune expired IPv6 pending handshake")
 				}
 				continue
 			}
-			c.maybeBlockIncompleteHandshakeIPv6(nowNS, key, val)
 		}
 		if err := iter.Err(); err != nil {
 			c.Logger.WithError(err).Warn("Failed to iterate IPv6 pending handshakes")
 		}
 	}
+
+	c.enforceIncompleteHandshakeThresholds(nowNS)
 }
 
-func (c *Collector) maybeBlockIncompleteHandshakeIPv4(nowNS uint64, key ebpf.TcpSessionKey, val ebpf.HandshakeStatusGeneric) {
-	if c.Config.IncompleteHandshakeThreshold == 0 {
+func (c *Collector) enforceIncompleteHandshakeThresholds(nowNS uint64) {
+	if c.Config.IncompleteHandshakeThreshold == 0 || c.Maps == nil {
 		return
 	}
-	if pendingHandshakeExpired(nowNS, val.BeginTime) {
-		return
-	}
-	if val.Count < c.Config.IncompleteHandshakeThreshold {
-		return
-	}
+	c.enforceIncompleteHandshakeThresholdsIPv4(nowNS)
+	c.enforceIncompleteHandshakeThresholdsIPv6(nowNS)
+}
 
-	ipBytes := make([]byte, 4)
-	binary.LittleEndian.PutUint32(ipBytes, key.Saddr)
-	ip := net.IP(ipBytes)
-	if c.checkAllowlist(ip) {
+func (c *Collector) enforceIncompleteHandshakeThresholdsIPv4(nowNS uint64) {
+	if c.Maps.IncompleteHandshakeCounts == nil {
 		return
 	}
+	cutoffNS := staleKernelCutoff(nowNS, kernelStateExpiryHandshake)
+	var key uint32
+	var entry ebpf.IncompleteHandshakeCount
+	iter := c.Maps.IncompleteHandshakeCounts.Iterate()
+	for iter.Next(&key, &entry) {
+		if entry.Count == 0 {
+			continue
+		}
+		if cutoffNS != 0 && entry.LastUpdated != 0 && entry.LastUpdated < cutoffNS {
+			continue
+		}
+		if entry.Count < c.Config.IncompleteHandshakeThreshold {
+			continue
+		}
+		ipBytes := make([]byte, 4)
+		binary.LittleEndian.PutUint32(ipBytes, key)
+		ip := net.IP(ipBytes)
+		if c.checkAllowlist(ip) {
+			continue
+		}
+		if err := c.blockIncompleteHandshakeIP(ip, entry.Count); err != nil {
+			c.Logger.WithError(err).WithFields(logrus.Fields{
+				"ip":                         ip.String(),
+				"reason":                     incompleteHandshakeBlockReason,
+				"incomplete_handshake_count": entry.Count,
+				"threshold":                  c.Config.IncompleteHandshakeThreshold,
+				"last_updated_ns":            entry.LastUpdated,
+			}).Warn("Failed to block IP for incomplete handshake flood")
+			continue
+		}
+		if err := c.purgePendingHandshakesForIPv4(ip); err != nil {
+			c.Logger.WithError(err).WithField("ip", ip.String()).Warn("Blocked IP but failed to purge IPv4 pending handshake state")
+		}
+	}
+	if err := iter.Err(); err != nil {
+		c.Logger.WithError(err).Warn("Failed to iterate IPv4 incomplete handshake counts")
+	}
+}
 
-	if err := c.Maps.BlockIP(ip); err != nil {
-		c.Logger.WithError(err).WithFields(logrus.Fields{
-			"ip":                         ip.String(),
-			"incomplete_handshake_count": val.Count,
-			"threshold":                  c.Config.IncompleteHandshakeThreshold,
-		}).Warn("Failed to block IP for incomplete handshake flood")
+func (c *Collector) enforceIncompleteHandshakeThresholdsIPv6(nowNS uint64) {
+	if c.Maps.IncompleteHandshakeCountsV6 == nil {
 		return
 	}
-
-	if err := c.Maps.PendingHandshakes.Delete(&key); err != nil {
-		c.Logger.WithError(err).WithField("ip", ip.String()).Debug("Failed to delete IPv4 pending handshake entry after block")
+	cutoffNS := staleKernelCutoff(nowNS, kernelStateExpiryHandshake)
+	var key [16]byte
+	var entry ebpf.IncompleteHandshakeCount
+	iter := c.Maps.IncompleteHandshakeCountsV6.Iterate()
+	for iter.Next(&key, &entry) {
+		if entry.Count == 0 {
+			continue
+		}
+		if cutoffNS != 0 && entry.LastUpdated != 0 && entry.LastUpdated < cutoffNS {
+			continue
+		}
+		if entry.Count < c.Config.IncompleteHandshakeThreshold {
+			continue
+		}
+		ip := net.IP(key[:])
+		if c.checkAllowlist(ip) {
+			continue
+		}
+		if err := c.blockIncompleteHandshakeIP(ip, entry.Count); err != nil {
+			c.Logger.WithError(err).WithFields(logrus.Fields{
+				"ip":                         ip.String(),
+				"reason":                     incompleteHandshakeBlockReason,
+				"incomplete_handshake_count": entry.Count,
+				"threshold":                  c.Config.IncompleteHandshakeThreshold,
+				"last_updated_ns":            entry.LastUpdated,
+			}).Warn("Failed to block IPv6 IP for incomplete handshake flood")
+			continue
+		}
+		if err := c.purgePendingHandshakesForIPv6(ip); err != nil {
+			c.Logger.WithError(err).WithField("ip", ip.String()).Warn("Blocked IPv6 IP but failed to purge pending handshake state")
+		}
 	}
+	if err := iter.Err(); err != nil {
+		c.Logger.WithError(err).Warn("Failed to iterate IPv6 incomplete handshake counts")
+	}
+}
 
+func (c *Collector) blockIncompleteHandshakeIP(ip net.IP, count uint32) error {
+	if err := c.Maps.BlockIP(ip, incompleteHandshakeBlockReason, logrus.Fields{
+		"reason":                     incompleteHandshakeBlockReason,
+		"incomplete_handshake_count": count,
+		"threshold":                  c.Config.IncompleteHandshakeThreshold,
+		"window":                     pendingHandshakeTimeout,
+		"block_duration":             c.Config.BlockDuration,
+	}); err != nil {
+		return err
+	}
 	metrics.IncompleteHandshakeBlocks.Inc()
 	c.Logger.WithFields(logrus.Fields{
 		"ip":                         ip.String(),
-		"incomplete_handshake_count": val.Count,
+		"reason":                     incompleteHandshakeBlockReason,
+		"incomplete_handshake_count": count,
 		"threshold":                  c.Config.IncompleteHandshakeThreshold,
 		"window":                     pendingHandshakeTimeout,
 		"block_duration":             c.Config.BlockDuration,
 	}).Warn("Blocked IP due to incomplete handshake flood")
+	return nil
 }
 
-func (c *Collector) maybeBlockIncompleteHandshakeIPv6(nowNS uint64, key ebpf.TcpSessionKeyV6, val ebpf.HandshakeStatusGeneric) {
-	if c.Config.IncompleteHandshakeThreshold == 0 {
-		return
+func (c *Collector) removePendingHandshakeIPv4(key ebpf.TcpSessionKey) error {
+	if c.Maps == nil || c.Maps.PendingHandshakes == nil {
+		return nil
 	}
-	if pendingHandshakeExpired(nowNS, val.BeginTime) {
-		return
+	if err := c.Maps.PendingHandshakes.Delete(&key); err != nil {
+		return err
 	}
-	if val.Count < c.Config.IncompleteHandshakeThreshold {
-		return
-	}
+	return c.decrementIncompleteHandshakeCountIPv4(key.Saddr)
+}
 
-	ip := net.IP(key.Saddr[:])
-	if c.checkAllowlist(ip) {
-		return
+func (c *Collector) removePendingHandshakeIPv6(key ebpf.TcpSessionKeyV6) error {
+	if c.Maps == nil || c.Maps.PendingHandshakesV6 == nil {
+		return nil
 	}
-
-	if err := c.Maps.BlockIP(ip); err != nil {
-		c.Logger.WithError(err).WithFields(logrus.Fields{
-			"ip":                         ip.String(),
-			"incomplete_handshake_count": val.Count,
-			"threshold":                  c.Config.IncompleteHandshakeThreshold,
-		}).Warn("Failed to block IPv6 IP for incomplete handshake flood")
-		return
-	}
-
 	if err := c.Maps.PendingHandshakesV6.Delete(&key); err != nil {
-		c.Logger.WithError(err).WithField("ip", ip.String()).Debug("Failed to delete IPv6 pending handshake entry after block")
+		return err
 	}
+	return c.decrementIncompleteHandshakeCountIPv6(key.Saddr)
+}
 
-	metrics.IncompleteHandshakeBlocks.Inc()
-	c.Logger.WithFields(logrus.Fields{
-		"ip":                         ip.String(),
-		"incomplete_handshake_count": val.Count,
-		"threshold":                  c.Config.IncompleteHandshakeThreshold,
-		"window":                     pendingHandshakeTimeout,
-		"block_duration":             c.Config.BlockDuration,
-	}).Warn("Blocked IPv6 IP due to incomplete handshake flood")
+func (c *Collector) decrementIncompleteHandshakeCountIPv4(saddr uint32) error {
+	if c.Maps == nil || c.Maps.IncompleteHandshakeCounts == nil {
+		return nil
+	}
+	var entry ebpf.IncompleteHandshakeCount
+	if err := c.Maps.IncompleteHandshakeCounts.Lookup(&saddr, &entry); err != nil {
+		return nil
+	}
+	if entry.Count <= 1 {
+		return c.Maps.IncompleteHandshakeCounts.Delete(&saddr)
+	}
+	entry.Count--
+	nowNS, err := monotonicNowNS()
+	if err == nil {
+		entry.LastUpdated = nowNS
+	}
+	return c.Maps.IncompleteHandshakeCounts.Put(saddr, entry)
+}
+
+func (c *Collector) decrementIncompleteHandshakeCountIPv6(saddr [16]byte) error {
+	if c.Maps == nil || c.Maps.IncompleteHandshakeCountsV6 == nil {
+		return nil
+	}
+	var entry ebpf.IncompleteHandshakeCount
+	if err := c.Maps.IncompleteHandshakeCountsV6.Lookup(&saddr, &entry); err != nil {
+		return nil
+	}
+	if entry.Count <= 1 {
+		return c.Maps.IncompleteHandshakeCountsV6.Delete(&saddr)
+	}
+	entry.Count--
+	nowNS, err := monotonicNowNS()
+	if err == nil {
+		entry.LastUpdated = nowNS
+	}
+	return c.Maps.IncompleteHandshakeCountsV6.Put(saddr, entry)
+}
+
+func (c *Collector) purgePendingHandshakesForIPv4(ip net.IP) error {
+	if c.Maps == nil || c.Maps.PendingHandshakes == nil {
+		return nil
+	}
+	ip4 := ip.To4()
+	if ip4 == nil {
+		return nil
+	}
+	saddr := binary.LittleEndian.Uint32(ip4)
+	var key ebpf.TcpSessionKey
+	var val ebpf.HandshakeStatusGeneric
+	iter := c.Maps.PendingHandshakes.Iterate()
+	keysToDelete := make([]ebpf.TcpSessionKey, 0)
+	for iter.Next(&key, &val) {
+		if key.Saddr == saddr {
+			keysToDelete = append(keysToDelete, key)
+		}
+	}
+	if err := iter.Err(); err != nil {
+		return err
+	}
+	for _, k := range keysToDelete {
+		if err := c.Maps.PendingHandshakes.Delete(&k); err != nil {
+			return err
+		}
+	}
+	if c.Maps.IncompleteHandshakeCounts != nil {
+		_ = c.Maps.IncompleteHandshakeCounts.Delete(&saddr)
+	}
+	return nil
+}
+
+func (c *Collector) purgePendingHandshakesForIPv6(ip net.IP) error {
+	if c.Maps == nil || c.Maps.PendingHandshakesV6 == nil {
+		return nil
+	}
+	ip16 := ip.To16()
+	if ip16 == nil {
+		return nil
+	}
+	var saddr [16]byte
+	copy(saddr[:], ip16)
+	var key ebpf.TcpSessionKeyV6
+	var val ebpf.HandshakeStatusGeneric
+	iter := c.Maps.PendingHandshakesV6.Iterate()
+	keysToDelete := make([]ebpf.TcpSessionKeyV6, 0)
+	for iter.Next(&key, &val) {
+		if key.Saddr == saddr {
+			keysToDelete = append(keysToDelete, key)
+		}
+	}
+	if err := iter.Err(); err != nil {
+		return err
+	}
+	for _, k := range keysToDelete {
+		if err := c.Maps.PendingHandshakesV6.Delete(&k); err != nil {
+			return err
+		}
+	}
+	if c.Maps.IncompleteHandshakeCountsV6 != nil {
+		_ = c.Maps.IncompleteHandshakeCountsV6.Delete(&saddr)
+	}
+	return nil
 }
 
 func (c *Collector) refreshICMPRates() {
@@ -1093,27 +1260,30 @@ func (c *Collector) cleanupStaleKernelState() {
 	removedUDPv4, removedUDPv6 := 0, 0
 	removedBadFlagsV4, removedBadFlagsV6 := 0, 0
 	removedHandshakesV4, removedHandshakesV6 := 0, 0
+	removedHandshakeCountsV4, removedHandshakeCountsV6 := 0, 0
 	cleanupErr := ""
 
 	defer func() {
 		duration := time.Since(start)
 		metrics.KernelStateCleanupDurationMilliseconds.Set(float64(duration.Milliseconds()))
 		fields := logrus.Fields{
-			"removed_total":         removedICMPv4 + removedICMPv6 + removedUDPv4 + removedUDPv6 + removedBadFlagsV4 + removedBadFlagsV6 + removedHandshakesV4 + removedHandshakesV6,
-			"icmp_v4":               removedICMPv4,
-			"icmp_v6":               removedICMPv6,
-			"udp_v4":                removedUDPv4,
-			"udp_v6":                removedUDPv6,
-			"bad_flags_v4":          removedBadFlagsV4,
-			"bad_flags_v6":          removedBadFlagsV6,
-			"pending_handshakes_v4": removedHandshakesV4,
-			"pending_handshakes_v6": removedHandshakesV6,
-			"rate_expiry":           kernelStateExpiryRate,
-			"bad_flags_expiry":      kernelStateExpiryBadFlags,
-			"handshake_expiry":      kernelStateExpiryHandshake,
-			"run_interval":          kernelStateCleanupInterval,
-			"duration":              duration,
-			"duration_milliseconds": duration.Milliseconds(),
+			"removed_total":                  removedICMPv4 + removedICMPv6 + removedUDPv4 + removedUDPv6 + removedBadFlagsV4 + removedBadFlagsV6 + removedHandshakesV4 + removedHandshakesV6 + removedHandshakeCountsV4 + removedHandshakeCountsV6,
+			"icmp_v4":                        removedICMPv4,
+			"icmp_v6":                        removedICMPv6,
+			"udp_v4":                         removedUDPv4,
+			"udp_v6":                         removedUDPv6,
+			"bad_flags_v4":                   removedBadFlagsV4,
+			"bad_flags_v6":                   removedBadFlagsV6,
+			"pending_handshakes_v4":          removedHandshakesV4,
+			"pending_handshakes_v6":          removedHandshakesV6,
+			"incomplete_handshake_counts_v4": removedHandshakeCountsV4,
+			"incomplete_handshake_counts_v6": removedHandshakeCountsV6,
+			"rate_expiry":                    kernelStateExpiryRate,
+			"bad_flags_expiry":               kernelStateExpiryBadFlags,
+			"handshake_expiry":               kernelStateExpiryHandshake,
+			"run_interval":                   kernelStateCleanupInterval,
+			"duration":                       duration,
+			"duration_milliseconds":          duration.Milliseconds(),
 		}
 		if cleanupErr != "" {
 			fields["error"] = cleanupErr
@@ -1134,14 +1304,17 @@ func (c *Collector) cleanupStaleKernelState() {
 		return
 	}
 
+	handshakeCutoff := staleKernelCutoff(nowNS, kernelStateExpiryHandshake)
 	removedICMPv4 = pruneKernelRateMap(c.Maps.ICMPRates, staleKernelCutoff(nowNS, kernelStateExpiryRate), c.Logger, "icmp_rates")
 	removedICMPv6 = pruneKernelRateMapV6(c.Maps.ICMPRatesV6, staleKernelCutoff(nowNS, kernelStateExpiryRate), c.Logger, "icmp_rates_v6")
 	removedUDPv4 = pruneKernelRateMap(c.Maps.UDPRates, staleKernelCutoff(nowNS, kernelStateExpiryRate), c.Logger, "udp_rates")
 	removedUDPv6 = pruneKernelRateMapV6(c.Maps.UDPRatesV6, staleKernelCutoff(nowNS, kernelStateExpiryRate), c.Logger, "udp_rates_v6")
 	removedBadFlagsV4 = pruneKernelBadFlagsMap(c.Maps.BadFlags, staleKernelCutoff(nowNS, kernelStateExpiryBadFlags), c.Logger, "bad_flags")
 	removedBadFlagsV6 = pruneKernelBadFlagsMapV6(c.Maps.BadFlagsV6, staleKernelCutoff(nowNS, kernelStateExpiryBadFlags), c.Logger, "bad_flags_v6")
-	removedHandshakesV4 = pruneKernelPendingHandshakesMap(c.Maps.PendingHandshakes, staleKernelCutoff(nowNS, kernelStateExpiryHandshake), c.Logger, "pending_handshakes")
-	removedHandshakesV6 = pruneKernelPendingHandshakesMapV6(c.Maps.PendingHandshakesV6, staleKernelCutoff(nowNS, kernelStateExpiryHandshake), c.Logger, "pending_handshakes_v6")
+	removedHandshakesV4 = pruneKernelPendingHandshakesMap(c.Maps.PendingHandshakes, handshakeCutoff, c.Logger, "pending_handshakes")
+	removedHandshakesV6 = pruneKernelPendingHandshakesMapV6(c.Maps.PendingHandshakesV6, handshakeCutoff, c.Logger, "pending_handshakes_v6")
+	removedHandshakeCountsV4 = pruneKernelIncompleteHandshakeCountMap(c.Maps.IncompleteHandshakeCounts, handshakeCutoff, c.Logger, "incomplete_handshake_counts")
+	removedHandshakeCountsV6 = pruneKernelIncompleteHandshakeCountMapV6(c.Maps.IncompleteHandshakeCountsV6, handshakeCutoff, c.Logger, "incomplete_handshake_counts_v6")
 }
 
 func staleKernelCutoff(nowNS uint64, ttl time.Duration) uint64 {
@@ -1309,6 +1482,60 @@ func pruneKernelPendingHandshakesMapV6(m *cebpf.Map, cutoffNS uint64, logger *lo
 			removed++
 		} else if logger != nil {
 			logger.WithError(err).WithField("map", mapName).Debug("Failed to delete stale kernel pending-handshake v6 entry")
+		}
+	}
+	return removed
+}
+
+func pruneKernelIncompleteHandshakeCountMap(m *cebpf.Map, cutoffNS uint64, logger *logrus.Logger, mapName string) int {
+	if m == nil {
+		return 0
+	}
+	var key uint32
+	var val ebpf.IncompleteHandshakeCount
+	iter := m.Iterate()
+	keysToDelete := make([]uint32, 0)
+	for iter.Next(&key, &val) {
+		if val.Count == 0 || (cutoffNS != 0 && val.LastUpdated != 0 && val.LastUpdated < cutoffNS) {
+			keysToDelete = append(keysToDelete, key)
+		}
+	}
+	if err := iter.Err(); err != nil && logger != nil {
+		logger.WithError(err).WithField("map", mapName).Warn("Failed to iterate incomplete-handshake count map for stale cleanup")
+	}
+	removed := 0
+	for _, k := range keysToDelete {
+		if err := m.Delete(&k); err == nil {
+			removed++
+		} else if logger != nil {
+			logger.WithError(err).WithField("map", mapName).Debug("Failed to delete stale incomplete-handshake count entry")
+		}
+	}
+	return removed
+}
+
+func pruneKernelIncompleteHandshakeCountMapV6(m *cebpf.Map, cutoffNS uint64, logger *logrus.Logger, mapName string) int {
+	if m == nil {
+		return 0
+	}
+	var key [16]byte
+	var val ebpf.IncompleteHandshakeCount
+	iter := m.Iterate()
+	keysToDelete := make([][16]byte, 0)
+	for iter.Next(&key, &val) {
+		if val.Count == 0 || (cutoffNS != 0 && val.LastUpdated != 0 && val.LastUpdated < cutoffNS) {
+			keysToDelete = append(keysToDelete, key)
+		}
+	}
+	if err := iter.Err(); err != nil && logger != nil {
+		logger.WithError(err).WithField("map", mapName).Warn("Failed to iterate incomplete-handshake count v6 map for stale cleanup")
+	}
+	removed := 0
+	for _, k := range keysToDelete {
+		if err := m.Delete(&k); err == nil {
+			removed++
+		} else if logger != nil {
+			logger.WithError(err).WithField("map", mapName).Debug("Failed to delete stale incomplete-handshake count v6 entry")
 		}
 	}
 	return removed
