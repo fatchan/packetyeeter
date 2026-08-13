@@ -27,7 +27,15 @@ Current responsibilities include:
 - HAProxy peer integration
 - UNIX socket management interface for `yeetctl`
 
-In short: this version is meant to be a **fast local enforcement daemon**, not a distributed collector/analyzer system.
+## Some personally catered features/changes:
+
+- Keeping haproxy peer to sync from a map of "seen" http3 requests to not apply as hard of udp ratelimit per threshold
+- Use haproxy dataplaneapi to sync map entries of backends and allowlisted ips from haproxy-panel-next control pane rather than existing allowlist sources
+- More parity between ipv4/v6 where some tracking/ratelimit/blocking was missing
+- Simple drop icmp and udp over threshold useful for some use cases
+- Simpler incomplete handshake triggering collector only blocking for better syn resistance without analyzer
+- Exact dropped packet count back in metrics rather than only incidents count
+- Logging supression to not spend less time on logging, more time dropping packets
 
 ## Included binaries
 

@@ -43,6 +43,11 @@ var (
 		Help: "Total TCP-related detections (SYN flood, bad flags, etc.)",
 	})
 
+	IncompleteHandshakeBlocks = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "packetyeeter_incomplete_handshake_blocks_total",
+		Help: "Total number of IP addresses auto-blocked due to recent incomplete handshake floods",
+	})
+
 	HAProxyBlocks = promauto.NewCounter(prometheus.CounterOpts{
 		Name: "packetyeeter_haproxy_blocks_total",
 		Help: "The total number of IP addresses blocked via HAProxy detections",

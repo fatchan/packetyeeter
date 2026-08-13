@@ -4,13 +4,13 @@ import (
 	"bytes"
 	"context"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
 	"strings"
 	"sync"
 	"time"
-	"errors"
 
 	"PacketYeeter/pkg/collector/ebpf"
 	"PacketYeeter/pkg/collector/haproxy"
@@ -27,26 +27,27 @@ import (
 
 // Config holds collector configuration
 type Config struct {
-	Interface                  string
-	Interfaces                 []string
-	MetricsAddr                string
-	HAProxyPort                int
-	SocketPath                 string
-	GeoIPASNPath               string
-	AllowlistCIDRs             string
-	PolicyRules                string
-	DynamicAllowlistSocketPath string
-	DynamicAllowlistInterval   time.Duration
-	HAProxyWhitelistMapPath    string
-	HAProxyBackendsMapPath     string
-	BlockDuration              time.Duration
-	PollInterval               time.Duration
-	ICMPThreshold              uint32
-	UDPThreshold               uint32
-	HTTP3SeenTTL               time.Duration
-	VerboseMapEntryUpdates     bool
-	DryRun                     bool
-	UDPFragMode                uint32
+	Interface                    string
+	Interfaces                   []string
+	MetricsAddr                  string
+	HAProxyPort                  int
+	SocketPath                   string
+	GeoIPASNPath                 string
+	AllowlistCIDRs               string
+	PolicyRules                  string
+	DynamicAllowlistSocketPath   string
+	DynamicAllowlistInterval     time.Duration
+	HAProxyWhitelistMapPath      string
+	HAProxyBackendsMapPath       string
+	BlockDuration                time.Duration
+	PollInterval                 time.Duration
+	ICMPThreshold                uint32
+	UDPThreshold                 uint32
+	IncompleteHandshakeThreshold uint32
+	HTTP3SeenTTL                 time.Duration
+	VerboseMapEntryUpdates       bool
+	DryRun                       bool
+	UDPFragMode                  uint32
 }
 
 // Collector is a collector-only enforcement daemon that:
@@ -315,9 +316,10 @@ func (c *Collector) Start(ctx context.Context) error {
 	}()
 
 	c.Logger.WithFields(logrus.Fields{
-		"interfaces":                c.Config.Interfaces,
-		"http3_seen_ttl":            c.Config.HTTP3SeenTTL,
-		"verbose_map_entry_updates": c.Config.VerboseMapEntryUpdates,
+		"interfaces":                     c.Config.Interfaces,
+		"http3_seen_ttl":                 c.Config.HTTP3SeenTTL,
+		"verbose_map_entry_updates":      c.Config.VerboseMapEntryUpdates,
+		"incomplete_handshake_threshold": c.Config.IncompleteHandshakeThreshold,
 	}).Info("Collector-only mode active")
 
 	c.Logger.Info("Collector started")
@@ -710,7 +712,9 @@ func (c *Collector) refreshPendingHandshakes() {
 				if err := c.Maps.PendingHandshakes.Delete(&key); err != nil {
 					c.Logger.WithError(err).Debug("Failed to prune expired IPv4 pending handshake")
 				}
+				continue
 			}
+			c.maybeBlockIncompleteHandshakeIPv4(nowNS, key, val)
 		}
 		if err := iter.Err(); err != nil {
 			c.Logger.WithError(err).Warn("Failed to iterate IPv4 pending handshakes")
@@ -726,12 +730,94 @@ func (c *Collector) refreshPendingHandshakes() {
 				if err := c.Maps.PendingHandshakesV6.Delete(&key); err != nil {
 					c.Logger.WithError(err).Debug("Failed to prune expired IPv6 pending handshake")
 				}
+				continue
 			}
+			c.maybeBlockIncompleteHandshakeIPv6(nowNS, key, val)
 		}
 		if err := iter.Err(); err != nil {
 			c.Logger.WithError(err).Warn("Failed to iterate IPv6 pending handshakes")
 		}
 	}
+}
+
+func (c *Collector) maybeBlockIncompleteHandshakeIPv4(nowNS uint64, key ebpf.TcpSessionKey, val ebpf.HandshakeStatusGeneric) {
+	if c.Config.IncompleteHandshakeThreshold == 0 {
+		return
+	}
+	if pendingHandshakeExpired(nowNS, val.BeginTime) {
+		return
+	}
+	if val.Count < c.Config.IncompleteHandshakeThreshold {
+		return
+	}
+
+	ipBytes := make([]byte, 4)
+	binary.LittleEndian.PutUint32(ipBytes, key.Saddr)
+	ip := net.IP(ipBytes)
+	if c.checkAllowlist(ip) {
+		return
+	}
+
+	if err := c.Maps.BlockIP(ip); err != nil {
+		c.Logger.WithError(err).WithFields(logrus.Fields{
+			"ip":                         ip.String(),
+			"incomplete_handshake_count": val.Count,
+			"threshold":                  c.Config.IncompleteHandshakeThreshold,
+		}).Warn("Failed to block IP for incomplete handshake flood")
+		return
+	}
+
+	if err := c.Maps.PendingHandshakes.Delete(&key); err != nil {
+		c.Logger.WithError(err).WithField("ip", ip.String()).Debug("Failed to delete IPv4 pending handshake entry after block")
+	}
+
+	metrics.IncompleteHandshakeBlocks.Inc()
+	c.Logger.WithFields(logrus.Fields{
+		"ip":                         ip.String(),
+		"incomplete_handshake_count": val.Count,
+		"threshold":                  c.Config.IncompleteHandshakeThreshold,
+		"window":                     pendingHandshakeTimeout,
+		"block_duration":             c.Config.BlockDuration,
+	}).Warn("Blocked IP due to incomplete handshake flood")
+}
+
+func (c *Collector) maybeBlockIncompleteHandshakeIPv6(nowNS uint64, key ebpf.TcpSessionKeyV6, val ebpf.HandshakeStatusGeneric) {
+	if c.Config.IncompleteHandshakeThreshold == 0 {
+		return
+	}
+	if pendingHandshakeExpired(nowNS, val.BeginTime) {
+		return
+	}
+	if val.Count < c.Config.IncompleteHandshakeThreshold {
+		return
+	}
+
+	ip := net.IP(key.Saddr[:])
+	if c.checkAllowlist(ip) {
+		return
+	}
+
+	if err := c.Maps.BlockIP(ip); err != nil {
+		c.Logger.WithError(err).WithFields(logrus.Fields{
+			"ip":                         ip.String(),
+			"incomplete_handshake_count": val.Count,
+			"threshold":                  c.Config.IncompleteHandshakeThreshold,
+		}).Warn("Failed to block IPv6 IP for incomplete handshake flood")
+		return
+	}
+
+	if err := c.Maps.PendingHandshakesV6.Delete(&key); err != nil {
+		c.Logger.WithError(err).WithField("ip", ip.String()).Debug("Failed to delete IPv6 pending handshake entry after block")
+	}
+
+	metrics.IncompleteHandshakeBlocks.Inc()
+	c.Logger.WithFields(logrus.Fields{
+		"ip":                         ip.String(),
+		"incomplete_handshake_count": val.Count,
+		"threshold":                  c.Config.IncompleteHandshakeThreshold,
+		"window":                     pendingHandshakeTimeout,
+		"block_duration":             c.Config.BlockDuration,
+	}).Warn("Blocked IPv6 IP due to incomplete handshake flood")
 }
 
 func (c *Collector) refreshICMPRates() {
@@ -1278,6 +1364,7 @@ func (c *Collector) startCollectorMetricsServer() *http.Server {
 	registry.MustRegister(metrics.KernelDroppedPacketsExact)
 	registry.MustRegister(metrics.KernelStateCleanupDurationMilliseconds)
 	registry.MustRegister(metrics.PerfLostSamples)
+	registry.MustRegister(metrics.IncompleteHandshakeBlocks)
 
 	metrics.PerfLostSamples.WithLabelValues("tcp_metadata").Add(0)
 	metrics.PerfLostSamples.WithLabelValues("incidents").Add(0)
