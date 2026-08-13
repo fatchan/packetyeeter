@@ -303,6 +303,13 @@ var (
 		Help: "Exact kernel-space dropped packets by incident reason",
 	}, []string{"reason"})
 
+	// KernelStateCleanupDurationMilliseconds records how long the most recent
+	// collector-side stale kernel-state cleanup pass took to run.
+	KernelStateCleanupDurationMilliseconds = promauto.NewGauge(prometheus.GaugeOpts{
+		Name: "packetyeeter_kernel_state_cleanup_duration_milliseconds",
+		Help: "Duration in milliseconds of the most recent collector kernel-state cleanup pass",
+	})
+
 	PerfLostSamples = promauto.NewCounterVec(prometheus.CounterOpts{
 		Name: "packetyeeter_perf_lost_samples_total",
 		Help: "Kernel perf-ring samples lost before userspace could read them",

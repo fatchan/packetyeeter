@@ -772,6 +772,8 @@ func (c *Collector) pollMaps() {
 
 	c.Logger.WithField("interval", interval).Info("Starting eBPF map poller")
 
+	lastKernelStateGC := time.Time{}
+
 	for {
 		select {
 		case <-c.ctx.Done():
@@ -785,6 +787,10 @@ func (c *Collector) pollMaps() {
 			c.sendBadFlagsAlerts()
 			c.sendEgressVolume()
 			c.pruneStaleState()
+			if lastKernelStateGC.IsZero() || time.Since(lastKernelStateGC) >= kernelStateCleanupInterval {
+				c.cleanupStaleKernelState()
+				lastKernelStateGC = time.Now()
+			}
 		}
 	}
 }
@@ -1691,8 +1697,10 @@ func ipNetFromIP(ip net.IP) *net.IPNet {
 // faster than the window: if a map still exceeds it, the map is reset, which at
 // worst re-emits already-deduplicated signals for one poll cycle.
 const (
-	prevStateStaleWindowNs uint64 = 300 * 1_000_000_000 // 5 minutes of kernel monotonic time
-	prevStateHardCap              = 1 << 18             // 262144 entries per map
+	prevStateStaleWindowNs   uint64        = 300 * 1_000_000_000 // 5 minutes of kernel monotonic time
+	prevStateHardCap                       = 1 << 18             // 262144 entries per map
+	kernelStateExpiry       time.Duration = 10 * time.Minute
+	kernelStateCleanupInterval             = 5 * time.Minute
 )
 
 func (c *Collector) pruneStaleState() {
@@ -1792,6 +1800,170 @@ func prunePrevSeenMap[K comparable](m map[K]uint64, maxClock uint64, logger *log
 			delete(m, k)
 		}
 	}
+}
+
+func (c *Collector) cleanupStaleKernelState() {
+	start := time.Now()
+	removedICMPv4, removedICMPv6 := 0, 0
+	removedUDPv4, removedUDPv6 := 0, 0
+	removedBadFlagsV4, removedBadFlagsV6 := 0, 0
+	cleanupErr := ""
+
+	defer func() {
+		duration := time.Since(start)
+		metrics.KernelStateCleanupDurationMilliseconds.Set(float64(duration.Milliseconds()))
+		fields := logrus.Fields{
+			"removed_total":           removedICMPv4 + removedICMPv6 + removedUDPv4 + removedUDPv6 + removedBadFlagsV4 + removedBadFlagsV6,
+			"icmp_v4":                 removedICMPv4,
+			"icmp_v6":                 removedICMPv6,
+			"udp_v4":                  removedUDPv4,
+			"udp_v6":                  removedUDPv6,
+			"bad_flags_v4":            removedBadFlagsV4,
+			"bad_flags_v6":            removedBadFlagsV6,
+			"expiry":                  kernelStateExpiry,
+			"run_interval":            kernelStateCleanupInterval,
+			"duration":                duration,
+			"duration_milliseconds":   duration.Milliseconds(),
+		}
+		if cleanupErr != "" {
+			fields["error"] = cleanupErr
+			c.Logger.WithFields(fields).Warn("Completed stale kernel map cleanup with error")
+			return
+		}
+		c.Logger.WithFields(fields).Info("Completed stale kernel map cleanup")
+	}()
+
+	if c.Maps == nil {
+		return
+	}
+
+	nowNS, err := monotonicNowNS()
+	if err != nil {
+		cleanupErr = fmt.Sprintf("failed to read monotonic clock for kernel state cleanup: %v", err)
+		c.Logger.WithError(err).Warn("Failed to read monotonic clock for kernel state cleanup")
+		return
+	}
+
+	cutoffNS := uint64(kernelStateExpiry)
+	if nowNS <= cutoffNS {
+		return
+	}
+	cutoffNS = nowNS - cutoffNS
+
+	removedICMPv4 = pruneKernelRateMap(c.Maps.ICMPRates, cutoffNS, c.Logger, "icmp_rates")
+	removedICMPv6 = pruneKernelRateMapV6(c.Maps.ICMPRatesV6, cutoffNS, c.Logger, "icmp_rates_v6")
+	removedUDPv4 = pruneKernelRateMap(c.Maps.UDPRates, cutoffNS, c.Logger, "udp_rates")
+	removedUDPv6 = pruneKernelRateMapV6(c.Maps.UDPRatesV6, cutoffNS, c.Logger, "udp_rates_v6")
+	removedBadFlagsV4 = pruneKernelBadFlagsMap(c.Maps.BadFlags, cutoffNS, c.Logger, "bad_flags")
+	removedBadFlagsV6 = pruneKernelBadFlagsMapV6(c.Maps.BadFlagsV6, cutoffNS, c.Logger, "bad_flags_v6")
+}
+
+func pruneKernelRateMap(m *cebpf.Map, cutoffNS uint64, logger *logrus.Logger, mapName string) int {
+	if m == nil {
+		return 0
+	}
+	var key uint32
+	var val ebpf.ICMPRate
+	iter := m.Iterate()
+	keysToDelete := make([]uint32, 0)
+	for iter.Next(&key, &val) {
+		if val.LastTime != 0 && val.LastTime < cutoffNS {
+			keysToDelete = append(keysToDelete, key)
+		}
+	}
+	if err := iter.Err(); err != nil && logger != nil {
+		logger.WithError(err).WithField("map", mapName).Warn("Failed to iterate kernel rate map for stale cleanup")
+	}
+	removed := 0
+	for _, k := range keysToDelete {
+		if err := m.Delete(&k); err == nil {
+			removed++
+		} else if logger != nil {
+			logger.WithError(err).WithField("map", mapName).Debug("Failed to delete stale kernel rate entry")
+		}
+	}
+	return removed
+}
+
+func pruneKernelRateMapV6(m *cebpf.Map, cutoffNS uint64, logger *logrus.Logger, mapName string) int {
+	if m == nil {
+		return 0
+	}
+	var key [16]byte
+	var val ebpf.ICMPRate
+	iter := m.Iterate()
+	keysToDelete := make([][16]byte, 0)
+	for iter.Next(&key, &val) {
+		if val.LastTime != 0 && val.LastTime < cutoffNS {
+			keysToDelete = append(keysToDelete, key)
+		}
+	}
+	if err := iter.Err(); err != nil && logger != nil {
+		logger.WithError(err).WithField("map", mapName).Warn("Failed to iterate kernel rate v6 map for stale cleanup")
+	}
+	removed := 0
+	for _, k := range keysToDelete {
+		if err := m.Delete(&k); err == nil {
+			removed++
+		} else if logger != nil {
+			logger.WithError(err).WithField("map", mapName).Debug("Failed to delete stale kernel rate v6 entry")
+		}
+	}
+	return removed
+}
+
+func pruneKernelBadFlagsMap(m *cebpf.Map, cutoffNS uint64, logger *logrus.Logger, mapName string) int {
+	if m == nil {
+		return 0
+	}
+	var key uint32
+	var val ebpf.BadFlagsInfo
+	iter := m.Iterate()
+	keysToDelete := make([]uint32, 0)
+	for iter.Next(&key, &val) {
+		if val.LastSeen != 0 && val.LastSeen < cutoffNS {
+			keysToDelete = append(keysToDelete, key)
+		}
+	}
+	if err := iter.Err(); err != nil && logger != nil {
+		logger.WithError(err).WithField("map", mapName).Warn("Failed to iterate kernel bad-flags map for stale cleanup")
+	}
+	removed := 0
+	for _, k := range keysToDelete {
+		if err := m.Delete(&k); err == nil {
+			removed++
+		} else if logger != nil {
+			logger.WithError(err).WithField("map", mapName).Debug("Failed to delete stale kernel bad-flags entry")
+		}
+	}
+	return removed
+}
+
+func pruneKernelBadFlagsMapV6(m *cebpf.Map, cutoffNS uint64, logger *logrus.Logger, mapName string) int {
+	if m == nil {
+		return 0
+	}
+	var key [16]byte
+	var val ebpf.BadFlagsInfo
+	iter := m.Iterate()
+	keysToDelete := make([][16]byte, 0)
+	for iter.Next(&key, &val) {
+		if val.LastSeen != 0 && val.LastSeen < cutoffNS {
+			keysToDelete = append(keysToDelete, key)
+		}
+	}
+	if err := iter.Err(); err != nil && logger != nil {
+		logger.WithError(err).WithField("map", mapName).Warn("Failed to iterate kernel bad-flags v6 map for stale cleanup")
+	}
+	removed := 0
+	for _, k := range keysToDelete {
+		if err := m.Delete(&k); err == nil {
+			removed++
+		} else if logger != nil {
+			logger.WithError(err).WithField("map", mapName).Debug("Failed to delete stale kernel bad-flags v6 entry")
+		}
+	}
+	return removed
 }
 
 // floodRateParams bundles the constants shared by the ICMP/UDP rate readers.
@@ -2058,6 +2230,7 @@ func (c *Collector) startCollectorMetricsServer() *http.Server {
 
 	registry.MustRegister(metrics.KernelIncidents)
 	registry.MustRegister(metrics.KernelDroppedPacketsExact)
+	registry.MustRegister(metrics.KernelStateCleanupDurationMilliseconds)
 	registry.MustRegister(metrics.PerfLostSamples)
 
 	metrics.PerfLostSamples.WithLabelValues("tcp_metadata").Add(0)
