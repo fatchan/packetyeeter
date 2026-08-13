@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"net"
 	"os"
-	"sort"
 )
 
 const defaultSocketPath = "/var/run/packetyeeter-collector.sock"
@@ -16,11 +15,6 @@ var (
 	SocketPath string
 	Command    string
 )
-
-type kv struct {
-	Key   string
-	Count int
-}
 
 type allowlistEntry struct {
 	CIDR    string `json:"cidr"`
@@ -35,24 +29,6 @@ type allowlistResponse struct {
 	Entries []allowlistEntry `json:"entries"`
 }
 
-type errorResponse struct {
-	Error string `json:"error"`
-}
-
-func sortedEntries(m map[string]int) []kv {
-	out := make([]kv, 0, len(m))
-	for k, v := range m {
-		out = append(out, kv{Key: k, Count: v})
-	}
-	sort.Slice(out, func(i, j int) bool {
-		if out[i].Count == out[j].Count {
-			return out[i].Key < out[j].Key
-		}
-		return out[i].Count > out[j].Count
-	})
-	return out
-}
-
 func main() {
 	flag.StringVar(&SocketPath, "sock", defaultSocketPath, "Path to PacketYeeter collector socket")
 	flag.Parse()
@@ -63,8 +39,6 @@ func main() {
 		fmt.Println("Commands:")
 		fmt.Println("  list       - List blocked IPs")
 		fmt.Println("  whitelist  - List current allowlist entries")
-		fmt.Println("  ai         - Show AI scraper detections summary")
-		fmt.Println("  bots       - Show bot categorization summary")
 		os.Exit(1)
 	}
 	Command = args[0]
@@ -140,127 +114,6 @@ func main() {
 				source = "dynamic"
 			}
 			fmt.Printf("  - %-39s [%s]\n", entry.CIDR, source)
-		}
-	} else if Command == "ai" {
-		type AISummary struct {
-			DetectionsByIP   map[string]int `json:"detections_by_ip"`
-			DetectionsByJA4H map[string]int `json:"detections_by_ja4h"`
-			DetectionsByASN  map[string]int `json:"detections_by_asn"`
-		}
-
-		_, err = conn.Write([]byte("AI"))
-		if err != nil {
-			fmt.Printf("Failed to send command: %v\n", err)
-			os.Exit(1)
-		}
-
-		var summary AISummary
-		if err := json.NewDecoder(conn).Decode(&summary); err != nil {
-			fmt.Printf("Failed to read response: %v\n", err)
-			os.Exit(1)
-		}
-
-		fmt.Println("AI Scraper Detections (last run)")
-		fmt.Println("By IP:")
-		ipEntries := sortedEntries(summary.DetectionsByIP)
-		for _, item := range ipEntries {
-			fmt.Printf("  %-20s %d\n", item.Key, item.Count)
-		}
-		if len(ipEntries) == 0 {
-			fmt.Println("  (none; collector does not currently expose analyzer AI state)")
-		}
-		fmt.Println("\nBy JA4H:")
-		ja4hEntries := sortedEntries(summary.DetectionsByJA4H)
-		for _, item := range ja4hEntries {
-			fmt.Printf("  %-20s %d\n", item.Key, item.Count)
-		}
-		if len(ja4hEntries) == 0 {
-			fmt.Println("  (none; collector does not currently expose analyzer AI state)")
-		}
-		fmt.Println("\nBy ASN:")
-		asnEntries := sortedEntries(summary.DetectionsByASN)
-		for _, item := range asnEntries {
-			fmt.Printf("  %-20s %d\n", item.Key, item.Count)
-		}
-		if len(asnEntries) == 0 {
-			fmt.Println("  (none; collector does not currently expose analyzer AI state)")
-		}
-	} else if Command == "bots" {
-		type BotStats struct {
-			TotalDetections    int            `json:"total_detections"`
-			ByCategory         map[string]int `json:"by_category"`
-			ByVerification     map[string]int `json:"by_verification"`
-			BehavioralPatterns map[string]int `json:"behavioral_patterns"`
-		}
-
-		_, err = conn.Write([]byte("BOTS"))
-		if err != nil {
-			fmt.Printf("Failed to send command: %v\n", err)
-			os.Exit(1)
-		}
-
-		var stats BotStats
-		if err := json.NewDecoder(conn).Decode(&stats); err != nil {
-			fmt.Printf("Failed to read response: %v\n", err)
-			os.Exit(1)
-		}
-
-		fmt.Println("Bot Detection Statistics")
-		fmt.Printf("\nTotal Detections: %d\n", stats.TotalDetections)
-
-		fmt.Println("\nBy Category:")
-		categoryLabels := map[string]string{
-			"ai_crawler_verified": "🤖 AI Crawler (Verified)",
-			"ai_crawler_unknown":  "🤖 AI Crawler (Unverified)",
-			"search_engine":       "🔍 Search Engine",
-			"scanner":             "🔎 Scanner",
-			"scraper":             "🕷️ Scraper",
-			"ddos":                "💥 DDoS",
-			"malicious":           "❌ Malicious",
-			"legitimate":          "✅ Legitimate",
-		}
-		for _, item := range sortedEntries(stats.ByCategory) {
-			label := categoryLabels[item.Key]
-			if label == "" {
-				label = item.Key
-			}
-			fmt.Printf("  %-35s %d\n", label, item.Count)
-		}
-		if len(stats.ByCategory) == 0 {
-			fmt.Println("  (none; collector does not currently expose analyzer bot state)")
-		}
-
-		fmt.Println("\nVerification Status:")
-		for _, item := range sortedEntries(stats.ByVerification) {
-			status := item.Key
-			switch status {
-			case "verified":
-				status = "✅ Verified"
-			case "failed":
-				status = "❌ Failed"
-			case "skipped":
-				status = "⏭️ Skipped"
-			}
-			fmt.Printf("  %-20s %d\n", status, item.Count)
-		}
-		if len(stats.ByVerification) == 0 {
-			fmt.Println("  (none; collector does not currently expose analyzer bot state)")
-		}
-
-		if len(stats.BehavioralPatterns) > 0 {
-			fmt.Println("\nBehavioral Patterns:")
-			for _, item := range sortedEntries(stats.BehavioralPatterns) {
-				pattern := item.Key
-				switch pattern {
-				case "persistent":
-					pattern = "Persistent (>1hr)"
-				case "high_frequency":
-					pattern = "High Frequency (>10/min)"
-				case "bursty":
-					pattern = "Bursty (irregular timing)"
-				}
-				fmt.Printf("  %-30s %d\n", pattern, item.Count)
-			}
 		}
 	} else {
 		fmt.Printf("Unknown command: %s\n", Command)

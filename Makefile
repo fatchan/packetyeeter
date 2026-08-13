@@ -1,10 +1,6 @@
 GO ?= go
 CLANG ?= clang
 GO_BIN := $(shell $(GO) env GOPATH)/bin
-BUF ?= $(GO_BIN)/buf
-BUF_VERSION ?= v1.65.0
-PROTOC_GEN_GO_VERSION ?= v1.36.11
-PROTOC_GEN_GO_GRPC_VERSION ?= v1.6.0
 NFPM ?= $(GO_BIN)/nfpm
 NFPM_VERSION ?= v2.41.1
 
@@ -24,17 +20,10 @@ LDFLAGS := -s -w \
 	-X PacketYeeter/pkg/buildinfo.Commit=$(COMMIT) \
 	-X PacketYeeter/pkg/buildinfo.BuildDate=$(BUILD_DATE)
 
-.PHONY: all proto bpf collector yeetctl clean install-buf install-nfpm deps lint test portable-test e2e-test linux install-services run-collector dist-binaries packages
+.PHONY: all bpf collector yeetctl clean install-nfpm deps lint test portable-test e2e-test e2e-ebpf-test linux install-services run-collector dist-binaries packages
 
 # Default target
-all: proto collector
-
-# Generate protobuf code
-proto:
-	@echo "Generating protobuf code..."
-	cd api/proto && PATH="$(GO_BIN):$$PATH" $(BUF) generate
-	@echo "Verifying generated files exist..."
-	ls -la api/proto/v1/*.pb.go
+all: collector
 
 # Compile the eBPF object embedded by pkg/collector/ebpf/loader.go.
 bpf: $(BPF_OBJ)
@@ -44,20 +33,14 @@ $(BPF_OBJ): $(BPF_SRC)
 	$(CLANG) -O2 -g -target bpf -D__TARGET_ARCH_$(BPF_ARCH) $(BPF_CFLAGS) -c $< -o $@
 
 # Build collector daemon
-collector: proto bpf
+collector: bpf
 	@echo "Building packetyeeter-collector..."
 	$(GO) build -ldflags="$(LDFLAGS)" -o packetyeeter-collector ./cmd/collector
 
 # Build CLI tool
-yeetctl: proto
+yeetctl:
 	@echo "Building yeetctl..."
 	$(GO) build -ldflags="$(LDFLAGS)" -o yeetctl ./cmd/yeetctl
-
-# Install buf for proto generation
-install-buf:
-	$(GO) install github.com/bufbuild/buf/cmd/buf@$(BUF_VERSION)
-	$(GO) install google.golang.org/protobuf/cmd/protoc-gen-go@$(PROTOC_GEN_GO_VERSION)
-	$(GO) install google.golang.org/grpc/cmd/protoc-gen-go-grpc@$(PROTOC_GEN_GO_GRPC_VERSION)
 
 # Install nfpm for building .deb packages
 install-nfpm:
@@ -69,26 +52,26 @@ deps:
 	$(GO) mod tidy
 
 # Run tests
-test: proto
+test:
 	$(GO) test -v ./...
 
 # Run portable tests that do not require Linux eBPF support.
-portable-test: proto
-	$(GO) test -v ./pkg/analyzer/... ./pkg/ml/... ./pkg/integration_test ./pkg/collector ./cmd/yeetctl
+portable-test:
+	$(GO) test -v ./pkg/integration_test ./pkg/collector ./cmd/yeetctl ./cmd/yeetexplorer
 
 # Run end-to-end tests that spawn a real haproxy binary to validate the
 # collector's SPOE agent against actual haproxy wire behavior. Requires
 # `haproxy` on PATH. Does not require Linux eBPF support since these tests
 # exercise the HAProxy integration layer behind a test double instead of the
 # real kernel maps.
-e2e-test: proto
+e2e-test:
 	$(GO) test -tags e2e -v ./pkg/collector/haproxy/...
 
 # Run the Linux/eBPF kernel-enforcement e2e test. Requires root (to
 # load/attach the real XDP program) and a Linux kernel with BPF support;
 # not runnable on macOS/portable environments. See pkg/collector/ebpf_e2e_test.go
 # for exactly what this does and does not verify.
-e2e-ebpf-test: proto bpf
+e2e-ebpf-test: bpf
 	sudo -E $(GO) test -tags e2e_ebpf -run TestKernelBlockEnforcement -v ./pkg/collector/...
 
 # Run linter
@@ -103,7 +86,7 @@ clean:
 	rm -rf $(DIST_DIR)
 
 # Build for Linux (cross-compile from macOS)
-linux: proto bpf
+linux: bpf
 	GOOS=linux GOARCH=amd64 $(GO) build -ldflags="$(LDFLAGS)" -o packetyeeter-collector-linux ./cmd/collector
 
 # Install systemd service files
@@ -118,17 +101,16 @@ run-collector: collector
 # Cross-compile release binaries into dist/.
 # The collector's eBPF object is built for the host architecture (see
 # BPF_ARCH above), so it is built amd64-only here (matching the linux/amd64
-# CI runner). yeetctl, yeetexplorer, and labeler are pure Go (CGO_ENABLED=0)
+# CI runner). yeetctl and yeetexplorer are pure Go (CGO_ENABLED=0)
 # and cross-compile cleanly for both amd64 and arm64.
-dist-binaries: proto bpf
+dist-binaries: bpf
 	@mkdir -p $(DIST_DIR)
 	GOOS=linux GOARCH=amd64 $(GO) build -ldflags="$(LDFLAGS)" -o $(DIST_DIR)/packetyeeter-collector-linux-amd64 ./cmd/collector
 	for arch in amd64 arm64; do \
 		GOOS=linux GOARCH=$$arch CGO_ENABLED=0 $(GO) build -ldflags="$(LDFLAGS)" -o $(DIST_DIR)/yeetctl-linux-$$arch ./cmd/yeetctl; \
 		GOOS=linux GOARCH=$$arch CGO_ENABLED=0 $(GO) build -ldflags="$(LDFLAGS)" -o $(DIST_DIR)/yeetexplorer-linux-$$arch ./cmd/yeetexplorer; \
-		GOOS=linux GOARCH=$$arch CGO_ENABLED=0 $(GO) build -ldflags="$(LDFLAGS)" -o $(DIST_DIR)/labeler-linux-$$arch ./cmd/labeler; \
 	done
-	cd $(DIST_DIR) && sha256sum packetyeeter-* yeetctl-* yeetexplorer-* labeler-* > SHA256SUMS
+	cd $(DIST_DIR) && sha256sum packetyeeter-* yeetctl-* yeetexplorer-* > SHA256SUMS
 
 # Build the collector .deb package (amd64 only). Requires the binary to be
 # built natively at the repo root first and nfpm installed (`make install-nfpm`).

@@ -13,8 +13,6 @@ import (
 )
 
 var (
-	// Counters for blocks vs detections
-
 	UDPBlocks = promauto.NewCounter(prometheus.CounterOpts{
 		Name: "packetyeeter_udp_blocks_total",
 		Help: "The total number of IP addresses blocked due to UDP floods",
@@ -45,78 +43,14 @@ var (
 		Help: "Total TCP-related detections (SYN flood, bad flags, etc.)",
 	})
 
-	// HAProxyBlocks counts blocks originating from the HAProxy/SPOE (layer 7)
-	// side of the pipeline, as opposed to the eBPF packet-path detections
-	// counted by TCPBlocks/UDPBlocks/ICMPBlocks. The metric name predates the
-	// removal of the stick-table peer listener and is kept for dashboard
-	// compatibility.
 	HAProxyBlocks = promauto.NewCounter(prometheus.CounterOpts{
 		Name: "packetyeeter_haproxy_blocks_total",
-		Help: "The total number of IP addresses blocked via HAProxy SPOE/HTTP detections",
+		Help: "The total number of IP addresses blocked via HAProxy detections",
 	})
 
 	HTTPDetections = promauto.NewCounter(prometheus.CounterOpts{
 		Name: "packetyeeter_http_detections_total",
-		Help: "Total HTTP/SPOE detections",
-	})
-
-	// Egress volume accounting (eBPF TC egress byte counters). These are the
-	// inputs to sustained-download detection, exported separately from the
-	// detection outcome so an operator can tell "the counters are not being
-	// read" apart from "nothing crossed a threshold".
-	EgressVolumeSignals = promauto.NewCounter(prometheus.CounterOpts{
-		Name: "packetyeeter_egress_volume_signals_total",
-		Help: "Total egress volume signals emitted by the collector",
-	})
-
-	EgressBytesReported = promauto.NewCounter(prometheus.CounterOpts{
-		Name: "packetyeeter_egress_bytes_reported_total",
-		Help: "Total bytes reported to the analyzer by the egress volume readers",
-	})
-
-	// Sustained-download detection. Decisions are labelled by selection path
-	// and by whether they were enforced, so a detect-only deployment can be
-	// tuned from the same series it will later enforce on.
-	SustainedDecisions = promauto.NewCounterVec(prometheus.CounterOpts{
-		Name: "packetyeeter_sustained_decisions_total",
-		Help: "Sustained-download decisions by selection path and outcome",
-	}, []string{"path", "outcome"})
-
-	SustainedTrackedClients = promauto.NewGauge(prometheus.GaugeOpts{
-		Name: "packetyeeter_sustained_tracked_clients",
-		Help: "Clients currently tracked for sustained-download detection",
-	})
-
-	SustainedHeldClients = promauto.NewGauge(prometheus.GaugeOpts{
-		Name: "packetyeeter_sustained_held_clients",
-		Help: "Clients kept selected by the enforcement hold rather than a current threshold crossing",
-	})
-
-	// SustainedClientEvictions growing means the window is shared by more
-	// clients than it was sized for, so detection is only being applied to an
-	// arbitrary subset of them. It is a capacity signal, not a detection one.
-	SustainedClientEvictions = promauto.NewCounter(prometheus.CounterOpts{
-		Name: "packetyeeter_sustained_client_evictions_total",
-		Help: "Clients dropped from sustained-download tracking because the client ceiling was reached",
-	})
-
-	// SustainedReputationDeferrals counts clients that cleared the base
-	// thresholds but were held below the reputation-raised ones.
-	SustainedReputationDeferrals = promauto.NewCounter(prometheus.CounterOpts{
-		Name: "packetyeeter_sustained_reputation_deferrals_total",
-		Help: "Sustained-download evaluations deferred because a good-reputation client was under the raised thresholds",
-	})
-
-	// Analyzer-wide runtime enforcement kill switch. Worth alerting on: it is
-	// one-way, so it stays set until the analyzer is restarted.
-	EnforcementStopped = promauto.NewGauge(prometheus.GaugeOpts{
-		Name: "packetyeeter_enforcement_stopped",
-		Help: "1 when the analyzer's runtime enforcement kill switch has been pulled",
-	})
-
-	EnforcementSuppressedCommands = promauto.NewCounter(prometheus.CounterOpts{
-		Name: "packetyeeter_enforcement_suppressed_commands_total",
-		Help: "Block commands not issued because the runtime enforcement kill switch is pulled",
+		Help: "Total HTTP detections",
 	})
 
 	HTTPFloodBlocks = promauto.NewCounter(prometheus.CounterOpts{
@@ -149,8 +83,6 @@ var (
 		Help: "Total blocks due to SYN floods",
 	})
 
-	// High Watermarks
-
 	HighestUDPRate = promauto.NewGauge(prometheus.GaugeOpts{
 		Name: "packetyeeter_udp_max_rate_pps",
 		Help: "Highest detected UDP packet rate (pps) from a single offender",
@@ -171,14 +103,10 @@ var (
 		Help: "Total ICMP packet rate (pps) across offenders",
 	})
 
-	// JA4T Fingerprinting
-
 	JA4TSuspiciousEvents = promauto.NewCounter(prometheus.CounterOpts{
 		Name: "packetyeeter_ja4t_suspicious_total",
 		Help: "Total number of suspicious activity events detected via JA4T fingerprinting",
 	})
-
-	// JA4L / Latency
 
 	HighLatencyEvents = promauto.NewCounter(prometheus.CounterOpts{
 		Name: "packetyeeter_high_latency_handshakes_total",
@@ -195,11 +123,9 @@ var (
 		Help: "Total number of events with suspicious TTL vs RTT mismatch (L3/L4 inconsistency)",
 	})
 
-	// SPOE Metrics
-
 	SPOELatencyReports = promauto.NewCounter(prometheus.CounterOpts{
 		Name: "packetyeeter_spoe_reports_total",
-		Help: "Total number of latency reports received via HAProxy SPOE",
+		Help: "Total number of latency reports received via HAProxy",
 	})
 
 	SPOEClientReqTimeHistogram = promauto.NewHistogram(prometheus.HistogramOpts{
@@ -239,36 +165,11 @@ var (
 		Help: "Number of SPOE messages dropped due to full queue",
 	})
 
-	CollectorSignalQueueDepth = promauto.NewGauge(prometheus.GaugeOpts{
-		Name: "packetyeeter_collector_signal_queue_depth",
-		Help: "Current depth of collector signal queue",
-	})
-
-	CollectorSignalQueueDrops = promauto.NewCounter(prometheus.CounterOpts{
-		Name: "packetyeeter_collector_signal_queue_drops_total",
-		Help: "Number of collector signals dropped due to full queue",
-	})
-
-	// DEPRECATED: Use AIDetectionsByBotCategory instead
-	// Kept for backwards compatibility during migration
-	AIScraperSignalsTotal     = AISignalsTotal
-	AIScraperSignalsByType    = AISignalsByType
-	AIScraperSignalsByASN     = AISignalsByASN
-	AIScraperDetectionsTotal  = AIDetectionsTotal
-	AIScraperDetectionsByASN  = AIDetectionsByASN
-	AIScraperDetectionsByJA4H = AIDetectionsByJA4H
-	AIScraperDetectionsByIP   = AIDetectionsByIP
-	AIScraperSignalEWMAByASN  = AISignalEWMAByASN
-	AIScraperSignalEWMAByJA4H = AISignalEWMAByJA4H
-
-	// Worker processing latency (formerly handler)
 	SPOEProcessingLatency = promauto.NewHistogram(prometheus.HistogramOpts{
 		Name:    "packetyeeter_spoe_processing_seconds",
 		Help:    "Time spent processing a SPOE message (worker)",
 		Buckets: []float64{0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1},
 	})
-
-	// GeoIP / ASN Metrics
 
 	LatencyByASN = promauto.NewHistogramVec(prometheus.HistogramOpts{
 		Name:    "packetyeeter_latency_by_asn_seconds",
@@ -286,25 +187,16 @@ var (
 		Help: "Total anomalies/abuse events by ASN",
 	}, []string{"asn", "org", "type"})
 
-	// KernelIncidents counts structured incident records emitted by the
-	// collector's own kernel-space enforcement (as opposed to blocks
-	// commanded by the analyzer). The "reason" label is a small, fixed
-	// enum (see ebpf.IncidentReasonName), so cardinality stays bounded.
 	KernelIncidents = promauto.NewCounterVec(prometheus.CounterOpts{
 		Name: "packetyeeter_kernel_incidents_total",
 		Help: "Structured kernel-space enforcement incidents by reason",
 	}, []string{"reason"})
 
-	// KernelDroppedPacketsExact is the exact packet-drop total from BPF-side
-	// per-reason counters. Unlike KernelIncidents, it does not depend on perf
-	// event delivery, perf budgeting, or userspace log throttling.
 	KernelDroppedPacketsExact = promauto.NewCounterVec(prometheus.CounterOpts{
 		Name: "packetyeeter_kernel_dropped_packets_total",
 		Help: "Exact kernel-space dropped packets by incident reason",
 	}, []string{"reason"})
 
-	// KernelStateCleanupDurationMilliseconds records how long the most recent
-	// collector-side stale kernel-state cleanup pass took to run.
 	KernelStateCleanupDurationMilliseconds = promauto.NewGauge(prometheus.GaugeOpts{
 		Name: "packetyeeter_kernel_state_cleanup_duration_milliseconds",
 		Help: "Duration in milliseconds of the most recent collector kernel-state cleanup pass",
@@ -314,173 +206,6 @@ var (
 		Name: "packetyeeter_perf_lost_samples_total",
 		Help: "Kernel perf-ring samples lost before userspace could read them",
 	}, []string{"reader"})
-
-	// AI Detection Engine Metrics (centralized)
-
-	AISignalsTotal = promauto.NewCounter(prometheus.CounterOpts{
-		Name: "packetyeeter_ai_signals_total",
-		Help: "Total number of AI detection signals received",
-	})
-
-	AISignalsByType = promauto.NewCounterVec(prometheus.CounterOpts{
-		Name: "packetyeeter_ai_signals_by_type_total",
-		Help: "AI detection signals by type",
-	}, []string{"type"})
-
-	AISignalsBySource = promauto.NewCounterVec(prometheus.CounterOpts{
-		Name: "packetyeeter_ai_signals_by_source_total",
-		Help: "AI detection signals by source",
-	}, []string{"source"})
-
-	AISignalsByASN = promauto.NewCounterVec(prometheus.CounterOpts{
-		Name: "packetyeeter_ai_signals_by_asn_total",
-		Help: "AI detection signals by ASN",
-	}, []string{"asn", "org", "type"})
-
-	AIDetectionsTotal = promauto.NewCounter(prometheus.CounterOpts{
-		Name: "packetyeeter_ai_detections_total",
-		Help: "Total number of AI detections triggered",
-	})
-
-	AIDetectionsByIP = promauto.NewCounterVec(prometheus.CounterOpts{
-		Name: "packetyeeter_ai_detections_by_ip_total",
-		Help: "AI detections by IP address",
-	}, []string{"ip"})
-
-	AIDetectionsByASN = promauto.NewCounterVec(prometheus.CounterOpts{
-		Name: "packetyeeter_ai_detections_by_asn_total",
-		Help: "AI detections by ASN",
-	}, []string{"asn", "org"})
-
-	AIDetectionsByJA4H = promauto.NewCounterVec(prometheus.CounterOpts{
-		Name: "packetyeeter_ai_detections_by_ja4h_total",
-		Help: "AI detections by JA4H fingerprint",
-	}, []string{"ja4h"})
-
-	AIDetectionConfidence = promauto.NewHistogram(prometheus.HistogramOpts{
-		Name:    "packetyeeter_ai_detection_confidence",
-		Help:    "Distribution of AI detection confidence scores",
-		Buckets: []float64{0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0},
-	})
-
-	AIRecentDetections = promauto.NewGaugeVec(prometheus.GaugeOpts{
-		Name: "packetyeeter_ai_recent_detections",
-		Help: "Recent AI detections metadata",
-	}, []string{"ip", "asn", "org", "category", "reason", "user_agent", "confidence", "threshold", "ja4h"})
-
-	AIConfidenceThreshold = promauto.NewGauge(prometheus.GaugeOpts{
-		Name: "packetyeeter_ai_confidence_threshold",
-		Help: "Current AI confidence threshold for blocking",
-	})
-
-	AIDetectionsByAction = promauto.NewCounterVec(prometheus.CounterOpts{
-		Name: "packetyeeter_ai_detections_action_total",
-		Help: "AI detections by action taken (block, dry_run, below_threshold)",
-	}, []string{"action"})
-
-	AttackCampaignDetections = promauto.NewCounterVec(prometheus.CounterOpts{
-		Name: "packetyeeter_attack_campaign_detections_total",
-		Help: "Analyzer-side attack campaign detections by vector and aggregate breadth reason",
-	}, []string{"vector", "reason"})
-
-	ActiveAttackCampaigns = promauto.NewGauge(prometheus.GaugeOpts{
-		Name: "packetyeeter_active_attack_campaigns",
-		Help: "Active analyzer-side attack campaigns in the current aggregation window",
-	})
-
-	CarpetBombingDetections = promauto.NewCounterVec(prometheus.CounterOpts{
-		Name: "packetyeeter_carpet_bombing_detections_total",
-		Help: "Carpet-bombing detections by vector and aggregate breadth reason",
-	}, []string{"vector", "reason"})
-
-	CampaignBaselineMultiplier = promauto.NewHistogramVec(prometheus.HistogramOpts{
-		Name:    "packetyeeter_campaign_baseline_multiplier",
-		Help:    "Observed campaign signal-rate multiplier over the adaptive service baseline",
-		Buckets: []float64{0.5, 1, 1.5, 2, 3, 5, 10, 20, 50},
-	}, []string{"vector", "protocol", "dst_port_bucket", "enough_samples"})
-
-	CampaignBaselineRate = promauto.NewGaugeVec(prometheus.GaugeOpts{
-		Name: "packetyeeter_campaign_baseline_rate",
-		Help: "Adaptive EWMA campaign signal baseline rate for a service key",
-	}, []string{"vector", "protocol", "dst_port_bucket", "enough_samples"})
-
-	AIBlocksBySignal = promauto.NewCounterVec(prometheus.CounterOpts{
-		Name: "packetyeeter_ai_blocks_by_signal_total",
-		Help: "AI blocks by top contributing signal",
-	}, []string{"signal"})
-
-	AISignalEWMAByASN = promauto.NewGaugeVec(prometheus.GaugeOpts{
-		Name: "packetyeeter_ai_signal_ewma_by_asn",
-		Help: "AI signal EWMA baseline by ASN",
-	}, []string{"asn", "org"})
-
-	AISignalEWMAByJA4H = promauto.NewGaugeVec(prometheus.GaugeOpts{
-		Name: "packetyeeter_ai_signal_ewma_by_ja4h",
-		Help: "AI signal EWMA baseline by JA4H",
-	}, []string{"ja4h"})
-
-	AIEngineQueueDepth = promauto.NewGauge(prometheus.GaugeOpts{
-		Name: "packetyeeter_ai_engine_queue_depth",
-		Help: "Current depth of AI detection signal queue",
-	})
-
-	AIEngineQueueDrops = promauto.NewCounter(prometheus.CounterOpts{
-		Name: "packetyeeter_ai_engine_queue_drops_total",
-		Help: "Total number of signals dropped due to full queue",
-	})
-
-	AIEngineQueueDepthByShard = promauto.NewGaugeVec(prometheus.GaugeOpts{
-		Name: "packetyeeter_ai_engine_queue_depth_by_shard",
-		Help: "Current AI detection signal queue depth by worker shard",
-	}, []string{"shard"})
-
-	AIEngineQueueDropsByShard = promauto.NewCounterVec(prometheus.CounterOpts{
-		Name: "packetyeeter_ai_engine_queue_drops_by_shard_total",
-		Help: "AI detection signals dropped due to a full queue by worker shard",
-	}, []string{"shard"})
-
-	AIEngineSignalIngressByType = promauto.NewCounterVec(prometheus.CounterOpts{
-		Name: "packetyeeter_ai_engine_signal_ingress_by_type_total",
-		Help: "AI detection signal enqueue attempts by signal type, including signals dropped due to queue pressure",
-	}, []string{"type"})
-
-	AISignalProcessingLatency = promauto.NewHistogram(prometheus.HistogramOpts{
-		Name:    "packetyeeter_ai_signal_processing_latency_seconds",
-		Help:    "Time to process an AI signal",
-		Buckets: prometheus.DefBuckets,
-	})
-
-	AISignalProcessingLatencyByShard = promauto.NewHistogramVec(prometheus.HistogramOpts{
-		Name:    "packetyeeter_ai_signal_processing_latency_by_shard_seconds",
-		Help:    "Time to process an AI signal by worker shard",
-		Buckets: prometheus.DefBuckets,
-	}, []string{"shard"})
-
-	// Bot/AI Detection Metrics (unified)
-	AIDetectionsByBotCategory = promauto.NewCounterVec(prometheus.CounterOpts{
-		Name: "packetyeeter_bot_detections_by_category_total",
-		Help: "Bot detections by category (ai_crawler_verified, search_engine, scanner, scraper, etc.)",
-	}, []string{"category"})
-
-	AIVerificationResults = promauto.NewCounterVec(prometheus.CounterOpts{
-		Name: "packetyeeter_bot_verification_results_total",
-		Help: "DNS/PTR/JA4 bot verification results (verified, failed, skipped, unknown)",
-	}, []string{"status"})
-
-	AIBehavioralPatterns = promauto.NewCounterVec(prometheus.CounterOpts{
-		Name: "packetyeeter_bot_behavioral_patterns_total",
-		Help: "Bot behavioral patterns detected (persistent, high_frequency, bursty)",
-	}, []string{"pattern"})
-
-	AIEngineWarmup = promauto.NewGauge(prometheus.GaugeOpts{
-		Name: "packetyeeter_ai_engine_warmup",
-		Help: "1 during AI engine warmup, 0 otherwise",
-	})
-
-	AIStateEntries = promauto.NewGaugeVec(prometheus.GaugeOpts{
-		Name: "packetyeeter_ai_state_entries",
-		Help: "Current retained analyzer AI state entries by bounded component",
-	}, []string{"component"})
 
 	ASNActiveIPs = promauto.NewGaugeVec(prometheus.GaugeOpts{
 		Name: "packetyeeter_asn_active_ips",
@@ -497,13 +222,6 @@ var (
 		Help: "Abusive IP fraction per ASN",
 	}, []string{"asn", "org"})
 
-	AIConfidenceByCategory = promauto.NewHistogramVec(prometheus.HistogramOpts{
-		Name:    "packetyeeter_bot_confidence_by_category",
-		Help:    "Bot detection confidence score distribution by category",
-		Buckets: []float64{0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0},
-	}, []string{"category"})
-
-	// JA4 Database Metrics
 	JA4DBLookups = promauto.NewCounter(prometheus.CounterOpts{
 		Name: "packetyeeter_ja4db_lookups_total",
 		Help: "Total JA4 database lookups performed",
@@ -560,7 +278,6 @@ var (
 		Help: "JA4/JA4H/JA4T matches by user agent (high cardinality; gated)",
 	}, []string{"type", "match_type", "ua"})
 
-	// Bot Verification Metrics
 	BotVerificationAttempts = promauto.NewCounterVec(prometheus.CounterOpts{
 		Name: "packetyeeter_bot_verification_attempts_total",
 		Help: "Total bot verification attempts by bot type",
@@ -581,34 +298,6 @@ var (
 		Help: "Current size of bot verification cache",
 	})
 
-	// ML Model Metrics
-	MLBotProbability = promauto.NewGauge(prometheus.GaugeOpts{
-		Name: "packetyeeter_ml_bot_probability",
-		Help: "Latest ML model bot probability prediction (0-1)",
-	})
-
-	MLPredictionTotal = promauto.NewCounter(prometheus.CounterOpts{
-		Name: "packetyeeter_ml_predictions_total",
-		Help: "Total number of ML model predictions made",
-	})
-
-	MLBotDetections = promauto.NewCounter(prometheus.CounterOpts{
-		Name: "packetyeeter_ml_bot_detections_total",
-		Help: "Total number of bot detections by ML model",
-	})
-
-	MLModelAccuracy = promauto.NewGauge(prometheus.GaugeOpts{
-		Name: "packetyeeter_ml_model_accuracy",
-		Help: "ML model accuracy (if labeled data available)",
-	})
-
-	MLConfidenceByCategory = promauto.NewHistogramVec(prometheus.HistogramOpts{
-		Name:    "packetyeeter_ml_confidence_by_category",
-		Help:    "ML confidence score distribution by predicted category",
-		Buckets: []float64{0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0},
-	}, []string{"category"})
-
-	// ASN Baseline Calibration Metrics
 	BaselineCalibratedASNs = promauto.NewGauge(prometheus.GaugeOpts{
 		Name: "packetyeeter_baseline_calibrated_asns",
 		Help: "Number of ASNs with sufficient baseline observations (100+)",
@@ -630,7 +319,6 @@ var (
 		Buckets: []float64{0, 1, 2, 3, 4, 5, 7, 10, 15, 20},
 	}, []string{"asn", "metric"})
 
-	// Threat Intelligence Metrics
 	ThreatIntelEnrichments = promauto.NewCounter(prometheus.CounterOpts{
 		Name: "packetyeeter_threat_intel_enrichments_total",
 		Help: "Total number of IP enrichments performed",
@@ -677,12 +365,6 @@ var (
 		Help: "Current size of Shodan InternetDB cache",
 	})
 
-	// ThreatIntelEnrichQueueDepth/Drops track the bounded worker pool that
-	// replaced unbounded per-signal goroutine spawning for enrichment
-	// lookups. Under a flood of many distinct source IPs, the queue can
-	// fill up; drops are expected/safe (enrichment is best-effort) and
-	// exist to bound goroutines/outbound HTTP calls to the threat intel
-	// source rather than let them grow unbounded.
 	ThreatIntelEnrichQueueDepth = promauto.NewGauge(prometheus.GaugeOpts{
 		Name: "packetyeeter_threat_intel_enrich_queue_depth",
 		Help: "Current depth of the bounded threat intel enrichment work queue",
@@ -693,7 +375,6 @@ var (
 		Help: "Total enrichment requests dropped because the bounded work queue was full",
 	})
 
-	// Path entropy metrics
 	PathEntropyByIP = promauto.NewGaugeVec(prometheus.GaugeOpts{
 		Name: "packetyeeter_http_path_entropy_by_ip",
 		Help: "HTTP path entropy by IP (rolling window)",
@@ -714,7 +395,6 @@ var (
 		Help: "Total number of Shodan API errors",
 	})
 
-	// Clock Skew Detection Metrics
 	ClockSkewObservations = promauto.NewCounter(prometheus.CounterOpts{
 		Name: "packetyeeter_clock_skew_observations_total",
 		Help: "Total number of clock skew observations recorded",
@@ -746,7 +426,6 @@ var (
 		Help: "Total number of detected clock skew changes (possible VM migration/replay)",
 	})
 
-	// Payload Entropy Detection Metrics
 	PayloadEntropyObservations = promauto.NewCounter(prometheus.CounterOpts{
 		Name: "packetyeeter_payload_entropy_observations_total",
 		Help: "Total number of payload entropy calculations",
@@ -773,11 +452,10 @@ var (
 		Help: "Number of active entropy profiles being tracked",
 	})
 
-	// Rate Limiting Metrics
 	RateLimitExceeded = promauto.NewCounterVec(prometheus.CounterOpts{
 		Name: "packetyeeter_rate_limit_exceeded_total",
 		Help: "Total number of rate limit violations",
-	}, []string{"type"}) // type: ip, asn
+	}, []string{"type"})
 
 	RateLimitActiveIPs = promauto.NewGauge(prometheus.GaugeOpts{
 		Name: "packetyeeter_rate_limit_active_ips",
@@ -798,33 +476,11 @@ var (
 		Name: "packetyeeter_rate_limit_currently_blocked_asns",
 		Help: "Number of ASNs blocked in the last time window",
 	})
-
-	// Pattern Tracking Metrics
-	PatternTrackerProfiles = promauto.NewGauge(prometheus.GaugeOpts{
-		Name: "packetyeeter_pattern_tracker_profiles",
-		Help: "Number of active connection pattern profiles being tracked",
-	})
-
-	PatternDetections = promauto.NewCounterVec(prometheus.CounterOpts{
-		Name: "packetyeeter_pattern_detections_total",
-		Help: "Total pattern-based detections by type",
-	}, []string{"type"}) // type: ttl_anomaly, window_anomaly, port_scanning, etc.
-
-	MLPredictionsByCategory = promauto.NewCounterVec(prometheus.CounterOpts{
-		Name: "packetyeeter_ml_predictions_by_category_total",
-		Help: "ML predictions by bot category",
-	}, []string{"category", "is_bot"})
-
-	MLBlocksOverridden = promauto.NewCounter(prometheus.CounterOpts{
-		Name: "packetyeeter_ml_blocks_overridden_total",
-		Help: "Total blocks prevented by ML model (false positive reduction)",
-	})
 )
 
 var highCardinalityEnabled atomic.Bool
 
 func init() {
-	// Default off; allow env override for debugging
 	if v := os.Getenv("PACKETYEETER_HIGH_CARDINALITY_METRICS"); v != "" {
 		if v == "1" || strings.EqualFold(v, "true") || strings.EqualFold(v, "yes") {
 			highCardinalityEnabled.Store(true)
@@ -840,10 +496,6 @@ func IsHighCardinalityEnabled() bool {
 	return highCardinalityEnabled.Load()
 }
 
-// The helpers below keep every exact-ASN/org metric behind the same
-// high-cardinality switch as per-IP and per-fingerprint metrics. ASN values are
-// externally supplied and org is free text; emitting them unconditionally
-// creates thousands of persistent series on normal public traffic.
 func SetHTTPRequestRateForASN(asn, org string, rate float64) {
 	if highCardinalityEnabled.Load() {
 		HTTPRequestRateByASN.WithLabelValues(asn, org).Set(rate)
@@ -865,20 +517,6 @@ func SetASNActivity(asn, org string, active, abusive int, ratio float64) {
 	ASNAbuseRatio.WithLabelValues(asn, org).Set(ratio)
 }
 
-func IncAISignalForASN(asn, org, signalType string) {
-	if highCardinalityEnabled.Load() {
-		AISignalsByASN.WithLabelValues(asn, org, signalType).Inc()
-	}
-}
-
-func ObserveAIDetectionForASN(asn, org string, ewma float64) {
-	if !highCardinalityEnabled.Load() {
-		return
-	}
-	AIDetectionsByASN.WithLabelValues(asn, org).Inc()
-	AISignalEWMAByASN.WithLabelValues(asn, org).Set(ewma)
-}
-
 func StartMetricsServer(addr string) *http.Server {
 	mux := http.NewServeMux()
 	mux.Handle("/metrics", promhttp.Handler())
@@ -886,9 +524,6 @@ func StartMetricsServer(addr string) *http.Server {
 	server := &http.Server{
 		Addr:    addr,
 		Handler: mux,
-		// The default addr binds all interfaces; without timeouts a
-		// slowloris client trickling header bytes pins goroutines and fds
-		// indefinitely.
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       10 * time.Second,
 		WriteTimeout:      30 * time.Second,
