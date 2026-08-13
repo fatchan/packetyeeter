@@ -1,7 +1,7 @@
 package collector
 
 import (
-	"encoding/binary"
+	// "encoding/binary"
 	"fmt"
 	"net"
 	"time"
@@ -9,7 +9,7 @@ import (
 	"google.golang.org/protobuf/types/known/timestamppb"
 
 	apiv1 "PacketYeeter/api/proto/v1"
-	"PacketYeeter/pkg/metrics"
+	// "PacketYeeter/pkg/metrics"
 )
 
 const (
@@ -61,71 +61,72 @@ func (c *Collector) sendEgressVolume() {
 		return
 	}
 
-	now := time.Now()
-	window := c.Config.PollInterval
-	if window <= 0 {
-		window = time.Second
-	}
-	windowSeconds := window.Seconds()
-
-	sent := 0
-	var totalBytes uint64
-
-	if c.Maps.EgressBytes != nil {
-		var key uint32
-		var total uint64
-		iter := c.Maps.EgressBytes.Iterate()
-		for iter.Next(&key, &total) {
-			if sent >= egressMaxBatchSize {
-				break
-			}
-			ipBytes := make([]byte, 4)
-			binary.LittleEndian.PutUint32(ipBytes, key)
-			delta, ok := deltaEgress(c.prevEgressBytes, key, total, now)
-			if !ok {
-				continue
-			}
-			if c.emitEgressSignal(net.IP(ipBytes), delta, total, windowSeconds) {
-				totalBytes += delta
-				sent++
-			}
-		}
-	}
-
-	// IPv6 carries its own per-poll budget so a large IPv4 client population
-	// cannot starve IPv6 emission on the same poll.
-	sentV6 := 0
-	if c.Maps.EgressBytesV6 != nil {
-		var key [16]byte
-		var total uint64
-		iter := c.Maps.EgressBytesV6.Iterate()
-		for iter.Next(&key, &total) {
-			if sentV6 >= egressMaxBatchSize {
-				break
-			}
-			delta, ok := deltaEgress(c.prevEgressBytesV6, key, total, now)
-			if !ok {
-				continue
-			}
-			if c.emitEgressSignal(net.IP(key[:]), delta, total, windowSeconds) {
-				totalBytes += delta
-				sentV6++
-			}
-		}
-	}
-
-	if n := sent + sentV6; n > 0 {
-		if metrics.EgressVolumeSignals != nil {
-			metrics.EgressVolumeSignals.Add(float64(n))
-		}
-		if metrics.EgressBytesReported != nil {
-			metrics.EgressBytesReported.Add(float64(totalBytes))
-		}
-		c.Logger.WithFields(map[string]interface{}{
-			"count": n,
-			"bytes": totalBytes,
-		}).Debug("Sent egress volume signals")
-	}
+	// temp disabled
+	// now := time.Now()
+	// window := c.Config.PollInterval
+	// if window <= 0 {
+	// 	window = time.Second
+	// }
+	// windowSeconds := window.Seconds()
+	//
+	// sent := 0
+	// var totalBytes uint64
+	//
+	// if c.Maps.EgressBytes != nil {
+	// 	var key uint32
+	// 	var total uint64
+	// 	iter := c.Maps.EgressBytes.Iterate()
+	// 	for iter.Next(&key, &total) {
+	// 		if sent >= egressMaxBatchSize {
+	// 			break
+	// 		}
+	// 		ipBytes := make([]byte, 4)
+	// 		binary.LittleEndian.PutUint32(ipBytes, key)
+	// 		delta, ok := deltaEgress(c.prevEgressBytes, key, total, now)
+	// 		if !ok {
+	// 			continue
+	// 		}
+	// 		if c.emitEgressSignal(net.IP(ipBytes), delta, total, windowSeconds) {
+	// 			totalBytes += delta
+	// 			sent++
+	// 		}
+	// 	}
+	// }
+	//
+	// // IPv6 carries its own per-poll budget so a large IPv4 client population
+	// // cannot starve IPv6 emission on the same poll.
+	// sentV6 := 0
+	// if c.Maps.EgressBytesV6 != nil {
+	// 	var key [16]byte
+	// 	var total uint64
+	// 	iter := c.Maps.EgressBytesV6.Iterate()
+	// 	for iter.Next(&key, &total) {
+	// 		if sentV6 >= egressMaxBatchSize {
+	// 			break
+	// 		}
+	// 		delta, ok := deltaEgress(c.prevEgressBytesV6, key, total, now)
+	// 		if !ok {
+	// 			continue
+	// 		}
+	// 		if c.emitEgressSignal(net.IP(key[:]), delta, total, windowSeconds) {
+	// 			totalBytes += delta
+	// 			sentV6++
+	// 		}
+	// 	}
+	// }
+	//
+	// if n := sent + sentV6; n > 0 {
+	// 	if metrics.EgressVolumeSignals != nil {
+	// 		metrics.EgressVolumeSignals.Add(float64(n))
+	// 	}
+	// 	if metrics.EgressBytesReported != nil {
+	// 		metrics.EgressBytesReported.Add(float64(totalBytes))
+	// 	}
+	// 	c.Logger.WithFields(map[string]interface{}{
+	// 		"count": n,
+	// 		"bytes": totalBytes,
+	// 	}).Debug("Sent egress volume signals")
+	// }
 }
 
 // deltaEgress updates the shadow map for one client and reports how many bytes

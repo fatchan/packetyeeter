@@ -609,15 +609,6 @@ func (c *Collector) Stop() {
 		}
 	}
 
-	c.mu.Lock()
-	if c.signalStream != nil {
-		c.signalStream.CloseSend()
-	}
-	if c.analyzerConn != nil {
-		c.analyzerConn.Close()
-	}
-	c.mu.Unlock()
-
 	if c.spoeAgent != nil {
 		c.spoeAgent.Stop()
 	}
@@ -642,6 +633,8 @@ func (c *Collector) Stop() {
 			c.Logger.WithError(err).Warn("Metrics server shutdown error")
 		}
 	}
+
+	c.resetAnalyzerConnection()
 
 	// Wait for goroutines with timeout. The map-polling and event goroutines
 	// still use the eBPF maps and the mmapped GeoIP DB, so those must stay
@@ -1697,10 +1690,12 @@ func ipNetFromIP(ip net.IP) *net.IPNet {
 // faster than the window: if a map still exceeds it, the map is reset, which at
 // worst re-emits already-deduplicated signals for one poll cycle.
 const (
-	prevStateStaleWindowNs   uint64        = 300 * 1_000_000_000 // 5 minutes of kernel monotonic time
-	prevStateHardCap                       = 1 << 18             // 262144 entries per map
-	kernelStateExpiry       time.Duration = 10 * time.Minute
-	kernelStateCleanupInterval             = 5 * time.Minute
+	prevStateStaleWindowNs       uint64        = 300 * 1_000_000_000 // 5 minutes of kernel monotonic time
+	prevStateHardCap                           = 1 << 18             // 262144 entries per map
+	kernelStateExpiryRate       time.Duration = 10 * time.Minute
+	kernelStateExpiryBadFlags   time.Duration = 10 * time.Minute
+	kernelStateExpiryHandshake  time.Duration = 30 * time.Second
+	kernelStateCleanupInterval                = 5 * time.Minute
 )
 
 func (c *Collector) pruneStaleState() {
@@ -1807,23 +1802,28 @@ func (c *Collector) cleanupStaleKernelState() {
 	removedICMPv4, removedICMPv6 := 0, 0
 	removedUDPv4, removedUDPv6 := 0, 0
 	removedBadFlagsV4, removedBadFlagsV6 := 0, 0
+	removedHandshakesV4, removedHandshakesV6 := 0, 0
 	cleanupErr := ""
 
 	defer func() {
 		duration := time.Since(start)
 		metrics.KernelStateCleanupDurationMilliseconds.Set(float64(duration.Milliseconds()))
 		fields := logrus.Fields{
-			"removed_total":           removedICMPv4 + removedICMPv6 + removedUDPv4 + removedUDPv6 + removedBadFlagsV4 + removedBadFlagsV6,
-			"icmp_v4":                 removedICMPv4,
-			"icmp_v6":                 removedICMPv6,
-			"udp_v4":                  removedUDPv4,
-			"udp_v6":                  removedUDPv6,
-			"bad_flags_v4":            removedBadFlagsV4,
-			"bad_flags_v6":            removedBadFlagsV6,
-			"expiry":                  kernelStateExpiry,
-			"run_interval":            kernelStateCleanupInterval,
-			"duration":                duration,
-			"duration_milliseconds":   duration.Milliseconds(),
+			"removed_total":         removedICMPv4 + removedICMPv6 + removedUDPv4 + removedUDPv6 + removedBadFlagsV4 + removedBadFlagsV6 + removedHandshakesV4 + removedHandshakesV6,
+			"icmp_v4":               removedICMPv4,
+			"icmp_v6":               removedICMPv6,
+			"udp_v4":                removedUDPv4,
+			"udp_v6":                removedUDPv6,
+			"bad_flags_v4":          removedBadFlagsV4,
+			"bad_flags_v6":          removedBadFlagsV6,
+			"pending_handshakes_v4": removedHandshakesV4,
+			"pending_handshakes_v6": removedHandshakesV6,
+			"rate_expiry":           kernelStateExpiryRate,
+			"bad_flags_expiry":      kernelStateExpiryBadFlags,
+			"handshake_expiry":      kernelStateExpiryHandshake,
+			"run_interval":          kernelStateCleanupInterval,
+			"duration":              duration,
+			"duration_milliseconds": duration.Milliseconds(),
 		}
 		if cleanupErr != "" {
 			fields["error"] = cleanupErr
@@ -1844,22 +1844,26 @@ func (c *Collector) cleanupStaleKernelState() {
 		return
 	}
 
-	cutoffNS := uint64(kernelStateExpiry)
-	if nowNS <= cutoffNS {
-		return
-	}
-	cutoffNS = nowNS - cutoffNS
+	removedICMPv4 = pruneKernelRateMap(c.Maps.ICMPRates, staleKernelCutoff(nowNS, kernelStateExpiryRate), c.Logger, "icmp_rates")
+	removedICMPv6 = pruneKernelRateMapV6(c.Maps.ICMPRatesV6, staleKernelCutoff(nowNS, kernelStateExpiryRate), c.Logger, "icmp_rates_v6")
+	removedUDPv4 = pruneKernelRateMap(c.Maps.UDPRates, staleKernelCutoff(nowNS, kernelStateExpiryRate), c.Logger, "udp_rates")
+	removedUDPv6 = pruneKernelRateMapV6(c.Maps.UDPRatesV6, staleKernelCutoff(nowNS, kernelStateExpiryRate), c.Logger, "udp_rates_v6")
+	removedBadFlagsV4 = pruneKernelBadFlagsMap(c.Maps.BadFlags, staleKernelCutoff(nowNS, kernelStateExpiryBadFlags), c.Logger, "bad_flags")
+	removedBadFlagsV6 = pruneKernelBadFlagsMapV6(c.Maps.BadFlagsV6, staleKernelCutoff(nowNS, kernelStateExpiryBadFlags), c.Logger, "bad_flags_v6")
+	removedHandshakesV4 = pruneKernelPendingHandshakesMap(c.Maps.PendingHandshakes, staleKernelCutoff(nowNS, kernelStateExpiryHandshake), c.Logger, "pending_handshakes")
+	removedHandshakesV6 = pruneKernelPendingHandshakesMapV6(c.Maps.PendingHandshakesV6, staleKernelCutoff(nowNS, kernelStateExpiryHandshake), c.Logger, "pending_handshakes_v6")
+}
 
-	removedICMPv4 = pruneKernelRateMap(c.Maps.ICMPRates, cutoffNS, c.Logger, "icmp_rates")
-	removedICMPv6 = pruneKernelRateMapV6(c.Maps.ICMPRatesV6, cutoffNS, c.Logger, "icmp_rates_v6")
-	removedUDPv4 = pruneKernelRateMap(c.Maps.UDPRates, cutoffNS, c.Logger, "udp_rates")
-	removedUDPv6 = pruneKernelRateMapV6(c.Maps.UDPRatesV6, cutoffNS, c.Logger, "udp_rates_v6")
-	removedBadFlagsV4 = pruneKernelBadFlagsMap(c.Maps.BadFlags, cutoffNS, c.Logger, "bad_flags")
-	removedBadFlagsV6 = pruneKernelBadFlagsMapV6(c.Maps.BadFlagsV6, cutoffNS, c.Logger, "bad_flags_v6")
+func staleKernelCutoff(nowNS uint64, ttl time.Duration) uint64 {
+	cutoffNS := uint64(ttl)
+	if nowNS <= cutoffNS {
+		return 0
+	}
+	return nowNS - cutoffNS
 }
 
 func pruneKernelRateMap(m *cebpf.Map, cutoffNS uint64, logger *logrus.Logger, mapName string) int {
-	if m == nil {
+	if m == nil || cutoffNS == 0 {
 		return 0
 	}
 	var key uint32
@@ -1886,7 +1890,7 @@ func pruneKernelRateMap(m *cebpf.Map, cutoffNS uint64, logger *logrus.Logger, ma
 }
 
 func pruneKernelRateMapV6(m *cebpf.Map, cutoffNS uint64, logger *logrus.Logger, mapName string) int {
-	if m == nil {
+	if m == nil || cutoffNS == 0 {
 		return 0
 	}
 	var key [16]byte
@@ -1913,7 +1917,7 @@ func pruneKernelRateMapV6(m *cebpf.Map, cutoffNS uint64, logger *logrus.Logger, 
 }
 
 func pruneKernelBadFlagsMap(m *cebpf.Map, cutoffNS uint64, logger *logrus.Logger, mapName string) int {
-	if m == nil {
+	if m == nil || cutoffNS == 0 {
 		return 0
 	}
 	var key uint32
@@ -1940,7 +1944,7 @@ func pruneKernelBadFlagsMap(m *cebpf.Map, cutoffNS uint64, logger *logrus.Logger
 }
 
 func pruneKernelBadFlagsMapV6(m *cebpf.Map, cutoffNS uint64, logger *logrus.Logger, mapName string) int {
-	if m == nil {
+	if m == nil || cutoffNS == 0 {
 		return 0
 	}
 	var key [16]byte
@@ -1961,6 +1965,60 @@ func pruneKernelBadFlagsMapV6(m *cebpf.Map, cutoffNS uint64, logger *logrus.Logg
 			removed++
 		} else if logger != nil {
 			logger.WithError(err).WithField("map", mapName).Debug("Failed to delete stale kernel bad-flags v6 entry")
+		}
+	}
+	return removed
+}
+
+func pruneKernelPendingHandshakesMap(m *cebpf.Map, cutoffNS uint64, logger *logrus.Logger, mapName string) int {
+	if m == nil || cutoffNS == 0 {
+		return 0
+	}
+	var key ebpf.TcpSessionKey
+	var val ebpf.HandshakeStatusGeneric
+	iter := m.Iterate()
+	keysToDelete := make([]ebpf.TcpSessionKey, 0)
+	for iter.Next(&key, &val) {
+		if val.BeginTime != 0 && val.BeginTime < cutoffNS {
+			keysToDelete = append(keysToDelete, key)
+		}
+	}
+	if err := iter.Err(); err != nil && logger != nil {
+		logger.WithError(err).WithField("map", mapName).Warn("Failed to iterate kernel pending-handshakes map for stale cleanup")
+	}
+	removed := 0
+	for _, k := range keysToDelete {
+		if err := m.Delete(&k); err == nil {
+			removed++
+		} else if logger != nil {
+			logger.WithError(err).WithField("map", mapName).Debug("Failed to delete stale kernel pending-handshake entry")
+		}
+	}
+	return removed
+}
+
+func pruneKernelPendingHandshakesMapV6(m *cebpf.Map, cutoffNS uint64, logger *logrus.Logger, mapName string) int {
+	if m == nil || cutoffNS == 0 {
+		return 0
+	}
+	var key ebpf.TcpSessionKeyV6
+	var val ebpf.HandshakeStatusGeneric
+	iter := m.Iterate()
+	keysToDelete := make([]ebpf.TcpSessionKeyV6, 0)
+	for iter.Next(&key, &val) {
+		if val.BeginTime != 0 && val.BeginTime < cutoffNS {
+			keysToDelete = append(keysToDelete, key)
+		}
+	}
+	if err := iter.Err(); err != nil && logger != nil {
+		logger.WithError(err).WithField("map", mapName).Warn("Failed to iterate kernel pending-handshakes v6 map for stale cleanup")
+	}
+	removed := 0
+	for _, k := range keysToDelete {
+		if err := m.Delete(&k); err == nil {
+			removed++
+		} else if logger != nil {
+			logger.WithError(err).WithField("map", mapName).Debug("Failed to delete stale kernel pending-handshake v6 entry")
 		}
 	}
 	return removed
@@ -2177,21 +2235,35 @@ func (c *Collector) signalSender() {
 
 var errSignalSendTimedOut = errors.New("timed out sending signal to analyzer")
 
-// sendSignalWithTimeout calls stream.Send in a goroutine and bounds how
-// long we wait for it to return. gRPC's ClientStream.Send does not accept
-// a per-call context/deadline, so this is the only way to detect a stuck
-// send without blocking the sender goroutine forever.
+// sendSignalWithTimeout bounds a stream.Send() call without spawning a helper
+// goroutine per signal. The send itself runs in the single sender goroutine;
+// on timeout we actively tear down the underlying connection so the blocked
+// Send unblocks and the reconnect loop can establish a fresh stream.
 func (c *Collector) sendSignalWithTimeout(stream apiv1.AnalyzerService_StreamSignalsClient, signal *apiv1.Signal, timeout time.Duration) error {
-	done := make(chan error, 1)
+	resultCh := make(chan error, 1)
 	go func() {
-		done <- stream.Send(signal)
+		resultCh <- stream.Send(signal)
 	}()
 
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+
 	select {
-	case err := <-done:
+	case err := <-resultCh:
 		return err
-	case <-time.After(timeout):
-		return errSignalSendTimedOut
+	case <-timer.C:
+		c.resetAnalyzerConnection()
+		select {
+		case err := <-resultCh:
+			if err != nil {
+				return err
+			}
+			return errSignalSendTimedOut
+		case <-time.After(time.Second):
+			return errSignalSendTimedOut
+		}
+	case <-c.ctx.Done():
+		return c.ctx.Err()
 	}
 }
 
@@ -2201,11 +2273,14 @@ func (c *Collector) sendSignalWithTimeout(stream apiv1.AnalyzerService_StreamSig
 // wedged on a half-broken stream.
 func (c *Collector) resetAnalyzerConnection() {
 	c.mu.Lock()
+	if c.signalStream != nil {
+		_ = c.signalStream.CloseSend()
+		c.signalStream = nil
+	}
 	if c.analyzerConn != nil {
 		c.analyzerConn.Close()
 		c.analyzerConn = nil
 		c.analyzerClient = nil
-		c.signalStream = nil
 	}
 	c.mu.Unlock()
 	c.connected.Store(false)

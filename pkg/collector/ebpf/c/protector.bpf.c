@@ -601,21 +601,31 @@ struct ip6_frag_hdr {
 // with this packet's length; a racing creation is resolved by BPF_ANY
 // overwriting with an equal value, which loses at most one packet's bytes.
 static __always_inline void account_egress_v4(__u32 client, __u64 len) {
-    __u64 *total = bpf_map_lookup_elem(&egress_bytes, &client);
-    if (total) {
-        __sync_fetch_and_add(total, len);
-        return;
-    }
-    bpf_map_update_elem(&egress_bytes, &client, &len, BPF_ANY);
+    // Egress byte accounting intentionally neutered for now.
+    // Keep the helper and maps in place to avoid loader/plumbing churn, but do
+    // not touch egress_bytes so TC egress no longer updates per-client totals.
+    // __u64 *total = bpf_map_lookup_elem(&egress_bytes, &client);
+    // if (total) {
+    //     __sync_fetch_and_add(total, len);
+    //     return;
+    // }
+    // bpf_map_update_elem(&egress_bytes, &client, &len, BPF_ANY);
+    (void)client;
+    (void)len;
 }
 
 static __always_inline void account_egress_v6(struct in6_addr *client, __u64 len) {
-    __u64 *total = bpf_map_lookup_elem(&egress_bytes_v6, client);
-    if (total) {
-        __sync_fetch_and_add(total, len);
-        return;
-    }
-    bpf_map_update_elem(&egress_bytes_v6, client, &len, BPF_ANY);
+    // Egress byte accounting intentionally neutered for now.
+    // Keep the helper and maps in place to avoid loader/plumbing churn, but do
+    // not touch egress_bytes_v6 so TC egress no longer updates per-client totals.
+    // __u64 *total = bpf_map_lookup_elem(&egress_bytes_v6, client);
+    // if (total) {
+    //     __sync_fetch_and_add(total, len);
+    //     return;
+    // }
+    // bpf_map_update_elem(&egress_bytes_v6, client, &len, BPF_ANY);
+    (void)client;
+    (void)len;
 }
 
 // emit_incident_v4/v6 record a structured incident (source, reason,
@@ -1452,6 +1462,8 @@ int tc_egress_synack_monitor(struct __sk_buff *skb) {
 
     // Looked up once per packet rather than once per address family so the
     // config_map lookup is not duplicated on both branches.
+    // Egress accounting is currently neutered in account_egress_v4/v6, so this
+    // flag no longer has any practical effect beyond preserving the old control flow.
     int account = egress_accounting_enabled();
     __u64 pkt_len = skb->len;
 
