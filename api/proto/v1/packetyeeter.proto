@@ -12,28 +12,28 @@ import "google/protobuf/empty.proto";
 service AnalyzerService {
   // Bidirectional streaming for real-time signal exchange
   rpc StreamSignals(stream Signal) returns (stream Command);
-  
+
   // Lookup JA4H fingerprint in the database
   rpc LookupJA4H(JA4HLookupRequest) returns (JA4HLookupResponse);
-  
+
   // Lookup JA4T fingerprint
   rpc LookupJA4T(JA4TLookupRequest) returns (JA4TLookupResponse);
-  
+
   // Verify if an IP/UA combination is a legitimate bot
   rpc VerifyBot(BotVerifyRequest) returns (BotVerifyResponse);
-  
+
   // Verify AI crawler (OpenAI, Anthropic, etc.)
   rpc VerifyAICrawler(AICrawlerVerifyRequest) returns (AICrawlerVerifyResponse);
-  
+
   // Get threat intelligence for an IP
   rpc GetThreatIntel(ThreatIntelRequest) returns (ThreatIntelResponse);
-  
+
   // Get reputation score for an entity
   rpc GetReputation(ReputationRequest) returns (ReputationResponse);
-  
+
   // Report blocked IP (for metrics/tracking)
   rpc ReportBlock(BlockReport) returns (google.protobuf.Empty);
-  
+
   // Health check
   rpc Health(google.protobuf.Empty) returns (HealthResponse);
 }
@@ -44,39 +44,33 @@ message Signal {
   google.protobuf.Timestamp timestamp = 2;
   SignalType type = 3;
   SignalSource source = 4;
-  
+
   // Network context
   bytes ip = 5;  // Can be IPv4 or IPv6
   string asn = 6;
   string org = 7;
-  
+
   // Fingerprints
   string ja4h = 8;
   string ja4t = 9;
   string ja4s = 10;
-  
+
   // Weight for scoring
   double weight = 11;
-  
+
   // Additional metadata
   map<string, string> metadata = 12;
-  
-  // HTTP context (from SPOE)
-  HTTPContext http_context = 13;
-  
+
   // TCP context (from eBPF)
   TCPContext tcp_context = 14;
 
   // TLS JA4 (client hello)
   string ja4 = 15;
-
-  // Egress volume context (from the eBPF TC egress byte counters)
-  EgressContext egress_context = 16;
 }
 
 enum SignalType {
   SIGNAL_UNKNOWN = 0;
-  
+
   // eBPF signals
   SIGNAL_SYN_FLOOD = 1;
   SIGNAL_BAD_FLAGS = 2;
@@ -89,30 +83,14 @@ enum SignalType {
   SIGNAL_PORT_SCANNING = 9;
   SIGNAL_INCOMPLETE_HANDSHAKE = 10;
   SIGNAL_TCP_METADATA = 11; // Per-packet TCP metadata (timestamps, entropy)
-  SIGNAL_EGRESS_VOLUME = 12; // Bytes transmitted to a client, from the TC egress counters
-  
-  // SPOE/HTTP signals
-  SIGNAL_HTTP_REQUEST = 20;  // Raw HTTP request from SPOE
-  SIGNAL_BOT_UA = 21;
-  SIGNAL_SUSPICIOUS_UA = 22;
-  SIGNAL_MISSING_ACCEPT_LANG = 23;
-  SIGNAL_MISSING_ACCEPT_ENC = 24;
-  SIGNAL_NO_COOKIES = 25;
-  SIGNAL_NO_REFERER = 26;
-  SIGNAL_MISSING_JA4H = 27;
-  SIGNAL_PROXY_LAG = 28;
-  SIGNAL_KNOWN_SCANNER = 29;
-  SIGNAL_HIGH_THREAT_SCORE = 30;
-  SIGNAL_TOR_NODE = 31;
-  SIGNAL_VPN_PROXY = 32;
-  
+
   // Fingerprint signals
   SIGNAL_JA4T_SUSPICIOUS = 40;
   SIGNAL_HIGH_LATENCY_HANDSHAKE = 41;
   SIGNAL_LATENCY_MISMATCH = 42;
   SIGNAL_GEO_ANOMALY = 43;
   SIGNAL_CONNECTION_PATTERN = 44;
-  
+
   // Analysis signals
   SIGNAL_CLOCK_SKEW_ANOMALY = 50;
   SIGNAL_ENTROPY_ANOMALY = 51;
@@ -122,34 +100,9 @@ enum SignalType {
 enum SignalSource {
   SOURCE_UNKNOWN = 0;
   SOURCE_EBPF = 1;
-  SOURCE_SPOE = 2;
   SOURCE_FINGERPRINTER = 3;
   SOURCE_HAPROXY = 4;
   SOURCE_ANALYZER = 5;
-}
-
-message HTTPContext {
-  string user_agent = 1;
-  string accept_language = 2;
-  string accept_encoding = 3;
-  string referer = 4;
-  bool has_cookies = 5;
-  string host = 6;
-  string method = 7;
-  string path = 8;
-  int64 client_req_ms = 9;
-  double packet_rtt_ms = 10;
-  uint32 dst_port = 11;  // Destination port (80, 443, etc.)
-  string dst_ip = 12;     // Destination IP address
-  uint32 status_code = 13; // HTTP response status code (200, 404, 403, etc.)
-  string accept = 14;          // Raw Accept header value
-  string sec_fetch_site = 15;  // Sec-Fetch-Site header value (browser-generated, hard to fake)
-  string sec_fetch_mode = 16;  // Sec-Fetch-Mode header value
-  string sec_fetch_dest = 17;  // Sec-Fetch-Dest header value
-  string sec_fetch_user = 18;  // Sec-Fetch-User header value
-  string tls_version = 19;     // Negotiated TLS protocol version (e.g. TLSv1.3)
-  string tls_cipher = 20;      // Negotiated TLS cipher suite
-  uint32 conn_request_count = 21; // Number of HTTP requests seen on this connection so far (keep-alive reuse)
 }
 
 message TCPContext {
@@ -166,44 +119,25 @@ message TCPContext {
   uint32 tcp_flags = 11;     // Raw TCP flags byte (SYN=0x02, ACK=0x10, etc.)
 }
 
-// EgressContext carries how many bytes the collector transmitted to a client
-// over one poll interval, measured on the eBPF TC egress path.
-//
-// This exists because HAProxy cannot report transferred bytes over SPOE: the
-// `bytes_out` sample fetch is stream-scoped and zeroed for every new stream,
-// and the on-http-response event fires before the response body is sent, so
-// SPOE only ever sees the advertised Content-Length. Counting on the egress
-// path measures real wire bytes and so covers chunked and streamed responses.
-message EgressContext {
-  // Bytes transmitted to this client since the previous signal.
-  uint64 bytes_delta = 1;
-  // Cumulative kernel counter at the time of sampling. Useful for spotting
-  // counter resets caused by LRU eviction or a collector restart.
-  uint64 bytes_total = 2;
-  // Length of the interval bytes_delta accumulated over, so the analyzer can
-  // derive a rate without assuming the collector's poll interval.
-  double window_seconds = 3;
-}
-
 // Command represents an action for the collector to execute
 message Command {
   string id = 1;
   google.protobuf.Timestamp timestamp = 2;
   CommandType type = 3;
-  
+
   // Target
   bytes ip = 4;
   string cidr = 5;  // For network-level blocks
-  
+
   // Duration (for temporary blocks)
   int64 duration_seconds = 6;
-  
+
   // Reason for audit trail
   string reason = 7;
-  
+
   // Priority (higher = more urgent)
   int32 priority = 8;
-  
+
   // Source that triggered this command
   string source = 9;
 }

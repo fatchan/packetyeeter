@@ -24,10 +24,10 @@ LDFLAGS := -s -w \
 	-X PacketYeeter/pkg/buildinfo.Commit=$(COMMIT) \
 	-X PacketYeeter/pkg/buildinfo.BuildDate=$(BUILD_DATE)
 
-.PHONY: all proto bpf collector analyzer yeetctl clean install-buf install-nfpm deps lint test portable-test e2e-test linux install-services run-collector run-analyzer dist-binaries packages
+.PHONY: all proto bpf collector yeetctl clean install-buf install-nfpm deps lint test portable-test e2e-test linux install-services run-collector dist-binaries packages
 
 # Default target
-all: proto collector analyzer
+all: proto collector
 
 # Generate protobuf code
 proto:
@@ -43,15 +43,10 @@ $(BPF_OBJ): $(BPF_SRC)
 	@echo "Compiling eBPF object..."
 	$(CLANG) -O2 -g -target bpf -D__TARGET_ARCH_$(BPF_ARCH) $(BPF_CFLAGS) -c $< -o $@
 
-# Build collector daemon (eBPF, SPOE, HAProxy)
+# Build collector daemon
 collector: proto bpf
 	@echo "Building packetyeeter-collector..."
 	$(GO) build -ldflags="$(LDFLAGS)" -o packetyeeter-collector ./cmd/collector
-
-# Build analyzer daemon (AI/ML, JA4DB, Reputation)
-analyzer: proto
-	@echo "Building packetyeeter-analyzer..."
-	$(GO) build -ldflags="$(LDFLAGS)" -o packetyeeter-analyzer ./cmd/analyzer
 
 # Build CLI tool
 yeetctl: proto
@@ -102,41 +97,32 @@ lint:
 
 # Clean build artifacts
 clean:
-	rm -f packetyeeter packetyeeter-collector packetyeeter-analyzer yeetctl
-	rm -f packetyeeter-collector-linux packetyeeter-analyzer-linux
+	rm -f packetyeeter packetyeeter-collector yeetctl
+	rm -f packetyeeter-collector-linux
 	rm -f $(BPF_OBJ)
 	rm -rf $(DIST_DIR)
 
 # Build for Linux (cross-compile from macOS)
 linux: proto bpf
 	GOOS=linux GOARCH=amd64 $(GO) build -ldflags="$(LDFLAGS)" -o packetyeeter-collector-linux ./cmd/collector
-	GOOS=linux GOARCH=amd64 $(GO) build -ldflags="$(LDFLAGS)" -o packetyeeter-analyzer-linux ./cmd/analyzer
 
 # Install systemd service files
 install-services:
 	sudo cp packetyeeter-collector.service /etc/systemd/system/
-	sudo cp packetyeeter-analyzer.service /etc/systemd/system/
 	sudo systemctl daemon-reload
 
 # Development: run collector locally
 run-collector: collector
-	sudo ./packetyeeter-collector -i lo -analyzer-addr localhost:9100
+	sudo ./packetyeeter-collector -i lo
 
-# Development: run analyzer locally
-run-analyzer: analyzer
-	./packetyeeter-analyzer -listen-addr 0.0.0.0:9100
-
-# Cross-compile release binaries into dist/. The collector's eBPF object
-# is built for the host architecture (see BPF_ARCH above) and the
-# analyzer links against onnxruntime via cgo, so neither can be easily
-# cross-compiled without a matching cross toolchain + arch-specific
-# onnxruntime library; both are built amd64-only here (matching the
-# linux/amd64 CI runner). yeetctl, yeetexplorer, and labeler are pure Go
-# (CGO_ENABLED=0) and cross-compile cleanly for both amd64 and arm64.
+# Cross-compile release binaries into dist/.
+# The collector's eBPF object is built for the host architecture (see
+# BPF_ARCH above), so it is built amd64-only here (matching the linux/amd64
+# CI runner). yeetctl, yeetexplorer, and labeler are pure Go (CGO_ENABLED=0)
+# and cross-compile cleanly for both amd64 and arm64.
 dist-binaries: proto bpf
 	@mkdir -p $(DIST_DIR)
 	GOOS=linux GOARCH=amd64 $(GO) build -ldflags="$(LDFLAGS)" -o $(DIST_DIR)/packetyeeter-collector-linux-amd64 ./cmd/collector
-	GOOS=linux GOARCH=amd64 $(GO) build -ldflags="$(LDFLAGS)" -o $(DIST_DIR)/packetyeeter-analyzer-linux-amd64 ./cmd/analyzer
 	for arch in amd64 arm64; do \
 		GOOS=linux GOARCH=$$arch CGO_ENABLED=0 $(GO) build -ldflags="$(LDFLAGS)" -o $(DIST_DIR)/yeetctl-linux-$$arch ./cmd/yeetctl; \
 		GOOS=linux GOARCH=$$arch CGO_ENABLED=0 $(GO) build -ldflags="$(LDFLAGS)" -o $(DIST_DIR)/yeetexplorer-linux-$$arch ./cmd/yeetexplorer; \
@@ -144,10 +130,8 @@ dist-binaries: proto bpf
 	done
 	cd $(DIST_DIR) && sha256sum packetyeeter-* yeetctl-* yeetexplorer-* labeler-* > SHA256SUMS
 
-# Build .deb packages for the collector and analyzer daemons (amd64
-# only, see dist-binaries for why). Requires the binaries to be built
-# natively at the repo root first and nfpm installed (`make install-nfpm`).
-packages: collector analyzer
+# Build the collector .deb package (amd64 only). Requires the binary to be
+# built natively at the repo root first and nfpm installed (`make install-nfpm`).
+packages: collector
 	@mkdir -p $(DIST_DIR)
 	VERSION=$(PKG_VERSION) ARCH=amd64 $(NFPM) package --config packaging/nfpm/collector.yaml --packager deb --target $(DIST_DIR)/
-	VERSION=$(PKG_VERSION) ARCH=amd64 $(NFPM) package --config packaging/nfpm/analyzer.yaml --packager deb --target $(DIST_DIR)/

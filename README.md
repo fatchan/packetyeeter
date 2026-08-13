@@ -1,517 +1,96 @@
 # PacketYeeter
 
-PacketYeeter is a high-performance, eBPF-based DDoS protection and traffic filtering tool written in Go. It leverages the Linux Kernel's XDP (Express Data Path) and TC (Traffic Control) subsystems to inspect, classify, and drop malicious traffic at line rate.
+This fork of PacketYeeter is a **collector-only** build focused on local traffic filtering and host-side enforcement.
 
-## Key Features
+The original upstream project included a separate analyzer service, ML, reputation scoring, and other higher-level detection components. This version removes that analyzer-centric architecture and keeps the simpler local collector path.
 
-1.  **SYN Flood Detection & Mitigation (Layer 4)**
-    *   **Detection**: Uses eBPF TC (Ingress/Egress) to track TCP handshake states. Pending entries are cleared when a matching ACK arrives; entries still incomplete after 3 seconds are consumed once and reported as per-source aggregates. Aggregate reports contribute detection evidence but are excluded from per-connection timing, baseline, clock-skew, and entropy training.
-    *   **Mitigation**: Incomplete-handshake signals are streamed to the analyzer, which applies the `-ddos-min-incomplete` threshold and returns a block decision over gRPC — blocking is analyzer-driven, not an automatic kernel-space decision.
-    *   **Enforcement**: XDP drops packets from IPs the collector has been told to block, before they reach the OS network stack.
-    *   **SYN cookies**: PacketYeeter does *not* implement its own SYN cookie challenge/response in XDP — because the XDP program transparently passes legitimate traffic straight into the local kernel's TCP stack, a spoofed SYN-ACK challenge answered directly by XDP would leave the client believing the connection is already established, so there is no protocol-safe way to hand it off to the real stack afterward without sending a second, unexpected SYN-ACK. Instead, the collector checks `net.ipv4.tcp_syncookies` at startup and logs a warning if it's disabled, since that's the kernel's own (already-present, battle-tested) SYN cookie implementation, complementing PacketYeeter's incomplete-handshake detection and `blocked_ips` enforcement above.
+For the original, fuller project, see:
 
-2.  **TCP Flag Sanitization**
-    *   Detects and drops invalid TCP flag combinations commonly used in reconnaissance scans and attacks:
-        *   **SYN-FIN** (Impossible state)
-        *   **Xmas Tree** (FIN + PSH + URG)
-        *   **NULL Scan** (No flags)
-    *   Each detection is classified by scan type and reported to the analyzer as a `SIGNAL_BAD_FLAGS` signal (previously these drops were kernel-only and invisible outside `packetyeeter_tcp_bad_flags_blocks_total`). Repeat offenders accumulate reputation penalties and can be banned via the same feedback loop used for other floods.
+- https://github.com/awlx/packetyeeter
 
-3.  **IP Allowlist (CIDR Support)**
-    *   Protect specific IPs or ranges (CIDR notation) from ever being blocked.
-    *   Allowlisted CIDRs are synced into kernel-space LPM trie maps (`allowlist_v4`/`allowlist_v6`) at startup and updated dynamically when the analyzer pushes allowlist commands, so the XDP program bypasses matching traffic directly; the collector's userspace block-decision path also honors the same list as a second layer of defense. (TC-side handshake/latency tracking still observes allowlisted traffic — it only tracks state, it never blocks.)
-    *   Supports both IPv4 and IPv6 CIDRs.
+## What this version does
 
-3.5. **Per-CIDR Policy Engine**
-    *   Lets an operator force a `block` or `monitor` decision for a whole network range via the `-policy` flag, checked in XDP right after the allowlist and before every other detection.
-    *   `block` drops all matching traffic outright (still subject to the collector's own `-dry-run`/monitor mode, so a new policy can be tested log-only before it takes effect).
-    *   `monitor` forces monitor-mode for matching sources only — useful for staging a CIDR's blast radius, or for a range that shouldn't be dropped by any detection but isn't fully allowlisted either.
-    *   Policy rules are kernel-space LPM trie maps (`policy_v4`/`policy_v6`), populated once at startup from `-policy`; they are not currently mutated at runtime by the analyzer (unlike the allowlist).
+The collector runs on a Linux host and uses **eBPF/XDP/TC** to inspect and control traffic close to the kernel.
 
-3.6. **Structured Incident Logging**
-    *   Every kernel-space drop decision (policy block, blocked-IP enforcement, ICMP/UDP rate-limit drop, IPv6 fragment drop, bad-flags drop) emits a compact structured record — source address, kernel timestamp, and a reason code — over a dedicated eBPF perf event array, in addition to whatever counters/signals that detection already produces.
-    *   The collector decodes these records and logs a single structured `logrus` entry per incident (fields: `ip`, `reason`, `kernel_timestamp`), giving operators a unified, per-packet-drop audit trail instead of having to correlate several counters.
-    *   Each incident also increments `packetyeeter_kernel_incidents_total{reason=...}`, a low-cardinality Prometheus counter (six known reason values) for dashboards/alerting.
-    *   This is purely an observability feature — it does not change enforcement behavior or generate new analyzer signals for reasons that already have one (bad flags, ICMP/UDP floods already stream `SIGNAL_*` events to the analyzer).
+Current responsibilities include:
 
-4.  **Volumetric Rate Limiting (ICMP & UDP)**
-    *   **ICMP**: Limits the rate of ICMP packets from a single source to prevent ping floods.
-    *   **UDP**: Strict rate limiting for UDP traffic to mitigate amplification/flood attacks.
-    *   Thresholds are enforced directly in XDP for maximum performance.
+- loading and attaching the PacketYeeter eBPF programs
+- maintaining local blocklists in kernel maps
+- enforcing IP blocks directly in XDP
+- CIDR allowlist support
+- per-CIDR policy handling
+- TCP bad-flags filtering
+- SYN-flood / incomplete-handshake tracking
+- ICMP and UDP rate limiting
+- local metrics export
+- local incident logging
+- HAProxy peer integration where still supported
+- UNIX socket management interface for `yeetctl`
 
-5.  **Reputation Engine (Anomaly Scoring)**
-    *   **Concept**: Assigns a numerical "Reputation Score" to every IP, JA4 fingerprint, and ASN interacting with the system.
-    *   **Scoring**:
-        *   Scores start at 0.
-        *   Points are added per detected signal using a per-signal weight (default `5.0`, capped at `20` for incomplete-handshake signals). The associated ASN is penalized at a fraction of that weight (`0.1`–`0.25`×), and the associated JA4H fingerprint at `0.6`×.
-        *   Scores degrade over time (decay factor `0.95` every 30 minutes) to forgive transient issues.
-    *   **Enforcement**: If a score exceeds the configured threshold (analyzer default: `75.0`, via `-reputation-threshold`), the entity is marked as a "Bad Actor" and subsequent traffic is dropped (or logged only in Dry-Run Mode).
-    *   **Metrics**: `packetyeeter_reputation_score` (Gauge) tracks the current score of all tracked entities.
+In short: this version is meant to be a **fast local enforcement daemon**, not a distributed collector/analyzer system.
 
-5.  **JA4T SSL/TCP Fingerprinting (Layer 4)**
-    *   **Detection**: Passive TCP fingerprinting based on window size, TCP options, and ordering (JA4T format), passed through from HAProxy SPOE.
-    *   **Abuse Detection**: JA4T abuse signals feed into the same generic AI signal-aggregation/confidence scoring as other behavioral signals (no JA4T-specific frequency window).
-    *   **Metrics**: `packetyeeter_ja4t_suspicious_total` (Counter) tracks abuse events.
+## Included binaries
 
-6.  **JA4L / Latency Monitoring**
-    *   **Detection**: Measures the RTT (Round Trip Time) of the TCP handshake (SYN-ACK -> ACK) passively via eBPF.
-    *   **Adaptive Baseline**: Maintains an EWMA per ASN to avoid penalizing inherently high-latency networks; flags spikes relative to each ASN.
-    *   **Alerting**: 
-        *   Logs warnings for high latency events.
-        *   Metrics: `packetyeeter_high_latency_handshakes_total` (Counter), `packetyeeter_high_latency_max_ms` (Gauge), `packetyeeter_latency_ewma_by_asn_ms` (GaugeVec).
+- `packetyeeter-collector` — main collector daemon
+- `yeetctl` — small CLI for inspecting collector state
+- `yeetexplorer` — terminal UI, if still present in your build
 
-7.  **GeoIP / ASN Intelligence**
-    *   **Enrichment**: Integrates with MaxMind GeoLite2 ASN databases to tag metrics with Autonomous System (ASN) and Organization data. Optionally also loads a GeoLite2-Country/City database (`-geoip-country`) for country-level enrichment, surfaced in the Inspector's "Threats by Country" panel.
-    *   **Insights**: Break down latency, abuse events, and traffic anomalies by Provider (e.g., "Google Cloud", "DigitalOcean") or by country.
-    *   **Metrics**:
-        *   `packetyeeter_latency_by_asn_seconds` (Histogram): Latency distribution per ASN.
-        *   `packetyeeter_abuse_by_asn_total` (Counter): Anomalies and blocks grouped by ASN.
+## Not included in this fork
 
-9.  **HAProxy SPOE / L7 Analytics (JA4H + AI Heuristics)**
-    *   **Goal**: Detect proxies/bots via protocol latency, JA4H fingerprinting, and behavioral signals.
-    *   **Mechanism**: HAProxy SPOE sends timestamps + HTTP features (JA4H via Lua, host, UA, headers, cookies) to PacketYeeter.
-    *   **Logic**:
-        *   Compare proxy lag (`client_req_ms` minus network RTT) against an adaptive per-ASN threshold.
-        *   **JA4H** fingerprinting via upstream lua (`fingerprint_ja4h`).
-        *   **Heuristics**: suspicious UA, missing headers, host-aware cookie expectations, honeypot paths, sequential path enumeration (alpha/numeric), low asset ratio (HTML >> assets).
-        *   **Detection**:
-            *   Static: `len(signals) >= 2` OR severe signals (`honeypot`, `numeric_seq`, `alpha_seq`).
-            *   Adaptive (EWMA): per-ASN proxy-lag baseline in milliseconds, with a 1000ms floor; flags when `proxy_lag_ms > max(1000, ewma_lag_ms*3 + 200)` (and, when RTT is known, also requires `proxy_lag_ms > rtt_ms*2`).
-    *   **Metrics**:
-        *   `packetyeeter_client_req_time_ms` (Histogram)
-        *   `packetyeeter_proxy_lag_max_ms` (Gauge)
-        *   `packetyeeter_proxy_lag_ewma_by_asn_ms` (GaugeVec)
-        *   `packetyeeter_spoe_anomaly_total` (Counter)
-        *   `packetyeeter_spoe_handler_seconds` (Histogram)
-        *   `packetyeeter_spoe_processing_seconds` (Histogram)
-        *   `packetyeeter_spoe_queue_depth` (Gauge)
-        *   `packetyeeter_spoe_queue_drops_total` (Counter)
-        *   `packetyeeter_ai_signals_total` (Counter)
-        *   `packetyeeter_ai_signals_by_type_total` (CounterVec)
-        *   `packetyeeter_ai_signals_by_asn_total` (CounterVec)
-        *   `packetyeeter_ai_detections_total` (Counter)
-        *   `packetyeeter_ai_detections_by_asn_total` (CounterVec)
-        *   `packetyeeter_ai_detections_by_ja4h_total` (CounterVec)
-        *   `packetyeeter_ai_detections_by_ip_total` (CounterVec)
-        *   `packetyeeter_ai_signal_ewma_by_asn` (GaugeVec)
-        *   `packetyeeter_ai_signal_ewma_by_ja4h` (GaugeVec)
+Removed from this simplified version:
 
-> **Consistency**: signals are canonicalized (case-insensitive) and block commands are deduped per IP to avoid double blocks from overlapping detectors.
+- analyzer daemon
+- reputation engine
+- ML / ONNX inference
+- analyzer gRPC pipeline
+- labeler tooling
+- analyzer-side bot / AI detection components
 
-> **Logging schema** (JSON): `component`, `event`, `ip`, `asn`, `ja4h`, `confidence`, `ml_confidence`, `ml_category`, `bot_category`, `reason`, `duration_secs`, `signal_count`, `signal_breakdown`, `source_breakdown`
+## Build
 
-> **Dashboards**: Prom/Influx dashboards map panels to metrics; see `docs/observability.md`.
-
-8.  **Sustained-Download Detection (Volume & Breadth)**
-    *   **Goal**: Catch scrapers, mirrors, and enumeration — abuse defined by *duration and breadth* rather than by rate. A client that stays under every per-second limit but sustains that rate for an hour across thousands of distinct resources is invisible to a rate limiter and obvious over a five-minute window.
-    *   **Two independent selection paths**, evaluated over the same sliding window:
-        *   **Volume**: many requests, many distinct resources, spread over many sections, moving a large number of bytes. Catches bulk mirroring and content theft.
-        *   **Shape**: many distinct resources spread thinly across many sections, with **no byte floor at all**. Catches enumeration, which would otherwise need a byte threshold low enough to sweep up legitimate traffic. A `resources-per-section` ceiling is what keeps ordinary deep usage (a CI job hammering a handful of sections) out of this path.
-    *   **Where the inputs come from**:
-        *   *Breadth* comes from the existing SPOE feed — `host` and `path` are already in the HTTP context, so no HAProxy configuration change is needed.
-        *   *Bytes* come from **eBPF TC egress per-client counters** (collector `-egress-accounting`), not from HAProxy. HAProxy cannot report transferred bytes over SPOE: its byte counters are stream-scoped, `on-http-response` fires before the body is transferred, and a fresh stream is allocated for each request on a keep-alive connection. The egress counters see real wire bytes, including streamed and chunked responses. Without `-egress-accounting` only the shape path can fire.
-    *   **Privacy**: hostnames and paths are reduced to 64-bit hashes on the way in and never retained. The tracker only ever counts and compares distinct values, so it never needs to read them back.
-    *   **Reputation raises thresholds, it does not exempt**: a verified crawler (Googlebot and friends, verified by the existing bot verifier) gets its request and byte floors multiplied by `-sustained-reputation-factor`. A verified crawler that starts mirroring the site is still caught, it just has to try harder. Resource and section floors are *not* raised — breadth is not an entitlement. Operator-allowlisted IPs are skipped entirely, consistent with the rest of the analyzer.
-    *   **Enforcement hold, with a hard ceiling**: blocking a client destroys the byte evidence that selected it, so a selected client stays selected for `-sustained-hold-seconds`. Release is judged on requests and breadth only — never bytes — and every leg must hold. `-sustained-max-hold-seconds` bounds this, because once enforcement has removed the evidence nothing measurable separates a false positive from a suppressed true positive. Good-reputation clients leave at the floor rather than the ceiling.
-    *   **Detect-only by default**: `-sustained-enabled` turns on measurement; `-sustained-enforce` is a *separate* flag that turns decisions into blocks. Tune against `GET /api/sustained` on the inspector, which reports per client which thresholds it is under (`blockers`) and how close it is to each (`margins`), plus a tri-state `watching` / `would_block` / `blocking` action.
-    *   **Metrics**: `packetyeeter_sustained_decisions_total{path,outcome}`, `packetyeeter_sustained_tracked_clients`, `packetyeeter_sustained_held_clients`, `packetyeeter_sustained_client_evictions_total`, `packetyeeter_sustained_reputation_deferrals_total`, plus the collector-side inputs `packetyeeter_egress_volume_signals_total` and `packetyeeter_egress_bytes_reported_total`.
-
-11. **Monitor / Dry-Run Mode & Runtime Enforcement Kill Switch**
-    *   Run the analyzer with `-dry-run` to log detections and update metrics **without** sending BLOCK commands to the collector.
-    *   Run the collector with `-dry-run` to put its own kernel-space detections (bad flags, SYN-flood blocklist, ICMP/UDP rate limits) into log-only mode **without** dropping matching traffic.
-    *   The two flags are independent; for a full dry-run rollout, enable both.
-    *   **Runtime kill switch**: `POST /api/enforcement/stop` on the analyzer's inspector (same-origin guarded) suppresses **every** enforcing command — from all detectors, not just one — while leaving detection, scoring, metrics, and the reporting surfaces running. `-dry-run` is a deployment decision fixed at startup; this is an incident response reachable in seconds, for when something is being blocked that should not be and there is no time to work out which detector is responsible.
-        *   *Relieving* commands (unblock, allowlist) are deliberately **not** suppressed. The switch is pulled precisely when a block is wrong, so stopping the commands that undo a block would make things worse.
-        *   Deliberately one-way. Resuming requires a config change and a restart, which leaves a record of the decision. State is not persisted, so a restart returns to the deployed configuration.
-        *   `GET /api/enforcement` reports the current state. `packetyeeter_enforcement_stopped` (gauge) and `packetyeeter_enforcement_suppressed_commands_total` (counter) expose it to alerting.
-
-12. **Observability & Metrics**
-    *   **Prometheus Exporters**: Each daemon exposes its own metrics endpoint (collector default `:2112`, analyzer default `:9091`) covering block counts, pps rates, reputation, and attack types.
-    *   **Structured Logging**: All logs are emitted in JSON format for easy ingestion by Logstash/Fluentd/Vector.
-    *   **Grafana Dashboard**: Includes a pre-built dashboard (`grafana-dashboard.json`) for visualizing attack traffic (IPs excluded in default dashboard; private dashboards can include IPs from metrics).
-
-## Project Docs
-
-*   [`CONTRIBUTING.md`](CONTRIBUTING.md): build, test, and PR workflow.
-*   [`SECURITY.md`](SECURITY.md): private vulnerability reporting guidance.
-*   [`docs/operations.md`](docs/operations.md): deployment, listener exposure, systemd, and rollout guidance.
-*   [`docs/troubleshooting.md`](docs/troubleshooting.md): common eBPF, build, and runtime issues.
-
-## Architecture
-
-PacketYeeter runs as **two cooperating daemons** connected over gRPC:
-
-*   **Collector** (`packetyeeter-collector`) — runs on each protected host. It loads the eBPF/XDP/TC programs, performs line-rate packet inspection and enforcement (blocking, rate limiting, flag sanitization), terminates the HAProxy Peer and SPOE protocols, and streams behavioral **signals** to the analyzer. It applies **BLOCK commands** returned by the analyzer directly in kernel-space maps. Requires root / BPF capabilities.
-*   **Analyzer** (`packetyeeter-analyzer`) — a userspace-only "brain" that receives signals from one or more collectors, runs the reputation engine, AI/ML bot detection, JA4+ fingerprint lookups, GeoIP/ASN enrichment, and threat intelligence (Shodan InternetDB), then returns BLOCK commands. It needs no special privileges and can run on a separate host.
-
-```mermaid
-graph TD
-    subgraph host["Protected Host"]
-        subgraph kernel["Kernel Space (eBPF)"]
-            XDP[XDP Filters<br/>block / rate-limit / bad-flags]
-            TC[TC Ingress/Egress<br/>handshake + latency tracking]
-        end
-        Collector[packetyeeter-collector<br/>loads BPF, HAProxy Peer + SPOE]
-        XDP <--> Collector
-        TC <--> Collector
-        Collector -->|:2112 /metrics| PromC[Prometheus]
-    end
-
-    subgraph brain["Analyzer Host"]
-        Analyzer[packetyeeter-analyzer<br/>reputation • AI/ML • JA4DB • threat intel]
-        Analyzer -->|:9091 /metrics| PromA[Prometheus]
-        Analyzer -->|:9092 inspector UI| Web[Browser]
-    end
-
-    Collector <-->|gRPC StreamSignals / Commands<br/>:9090| Analyzer
-    Analyzer -->|Shodan InternetDB / GeoIP| Ext[(External Data)]
-    PromC --> Grafana[Grafana Dashboard]
-    PromA --> Grafana
-```
-
-The `AnalyzerService` gRPC contract (`api/proto/v1/packetyeeter.proto`) exposes a bidirectional `StreamSignals(stream Signal) -> stream Command` channel (collector → analyzer signals, analyzer → collector commands) plus request/response RPCs for JA4H/JA4T lookups, bot/AI-crawler verification, threat intel, and reputation.
-
-### Binaries
-
-| Binary | Location | Purpose |
-| :--- | :--- | :--- |
-| `packetyeeter-collector` | `cmd/collector` | eBPF loader + enforcer, HAProxy Peer/SPOE, gRPC client. Root required. |
-| `packetyeeter-analyzer` | `cmd/analyzer` | AI/ML + reputation + threat-intel gRPC server. No privileges needed. |
-| `yeetctl` | `cmd/yeetctl` | CLI to inspect collector state over a UNIX socket. |
-| `yeetexplorer` | `cmd/yeetexplorer` | Interactive terminal (TUI) dashboard for live inspection. |
-| `labeler` | `cmd/labeler` | Offline tool to label captured sessions for ML training. |
-
-## Prerequisites
-
-*   **OS**: Linux (Kernel 5.4+ recommended) for the collector. The analyzer is portable userspace Go.
-*   **Collector build dependencies**:
-    *   `clang`, `llvm`
-    *   `libbpf-dev`
-    *   `linux-headers` (matching current kernel)
-*   **Go**: 1.26.4+
-*   **Proto (optional, only to regenerate)**: `buf`, `protoc-gen-go`, `protoc-gen-go-grpc` (`make install-buf`).
-
-## Installation
-
-1.  **Clone & Tidy**:
-    ```bash
-    git clone https://github.com/awlx/packetyeeter.git
-    cd packetyeeter
-    make deps
-    ```
-
-2.  **Build with the Makefile** (recommended):
-    ```bash
-    make            # proto + collector + analyzer
-    make collector  # packetyeeter-collector only (needs the compiled BPF object, see below)
-    make analyzer   # packetyeeter-analyzer only
-    make yeetctl    # yeetctl CLI
-    ```
-
-    The BPF object (`pkg/collector/ebpf/c/protector.bpf.o`) is embedded into the
-    collector via `//go:embed`, so it must be compiled **before** building the
-    collector:
-
-    ```bash
-    clang -O2 -g -target bpf -I/usr/include/x86_64-linux-gnu \
-        -c pkg/collector/ebpf/c/protector.bpf.c \
-        -o pkg/collector/ebpf/c/protector.bpf.o
-    go build -o packetyeeter-collector ./cmd/collector
-    ```
-
-    > NOTE: `make test` / `go test ./...` needs the compiled `protector.bpf.o`
-    > present (run the `clang` step or `deploy.sh` first).
-
-    **Testing tiers**:
-    - `make portable-test` — unit/integration tests that don't need Linux/eBPF; runs anywhere.
-    - `make e2e-test` — spins up a real `haproxy` binary (must be on `PATH`) and drives it against the collector's HAProxy peer-protocol listener and SPOE agent to validate wire compatibility. Portable to any OS with `haproxy` installed; no kernel/eBPF required.
-    - `make e2e-ebpf-test` — loads and attaches the real eBPF/XDP program to a scratch dummy interface and verifies that a block command from the analyzer is written to and readable from the real kernel map. Requires Linux, root, and the compiled BPF object (`make bpf`); not portable.
-
-3.  **Remote deployment** with `deploy.sh`:
-    ```bash
-    # Usage: ./deploy.sh <host> [collector|analyzer|both] [options]
-
-    # Deploy both daemons to a host and install/enable systemd services
-    ./deploy.sh webfrontend01.example.com both -i ens192 --install-service
-
-    # Deploy only the collector, pointing it at a remote analyzer
-    ./deploy.sh webfrontend01.example.com collector -i eth0 --analyzer-addr 10.0.0.5:9090
-
-    # Deploy only the analyzer
-    ./deploy.sh analyzer.example.com analyzer --listen-addr 0.0.0.0:9090
-
-    # First-time host: install build deps too
-    ./deploy.sh webfrontend01.example.com both --install-deps --install-service
-    ```
-
-    Options: `--install-deps`, `--install-service`, `--regen-proto`,
-    `-i/--interface`, `--analyzer-addr`, `--listen-addr`, `--metrics-addr`.
-
-4.  **Pre-built binaries, packages, and Docker images**: every push to `main`
-    and every `vX.Y.Z` tag builds and publishes release artifacts via CI:
-    - Standalone binaries and checksums (`SHA256SUMS`) for
-      `packetyeeter-collector`/`packetyeeter-analyzer` (linux/amd64) and
-      `yeetctl`/`yeetexplorer`/`labeler` (linux/amd64 + linux/arm64) — attached
-      to the [GitHub Release](https://github.com/awlx/packetyeeter/releases)
-      for tags, or downloadable as a CI build artifact for `main`.
-    - `.deb` packages (linux/amd64) built with [nfpm](https://nfpm.goreleaser.com/)
-      from `packaging/nfpm/{collector,analyzer}.yaml`, installing binaries to
-      `/opt/packetyeeter/{collector,analyzer}/`, systemd units to
-      `/etc/systemd/system/`, and config to `/etc/default/`. Installing the
-      package does **not** enable or start the service — review the config
-      first, then `sudo systemctl enable --now packetyeeter-<collector|analyzer>`.
-      Build locally with `make install-nfpm packages`.
-    - Docker images at `ghcr.io/awlx/packetyeeter-analyzer` and
-      `ghcr.io/awlx/packetyeeter-collector`, tagged `main`/commit SHA from
-      `main` pushes, and `<tag>`/`latest`/commit SHA from version tags. Build
-      locally with `docker build --target analyzer .` or
-      `docker build --target collector .`. The collector image needs to run
-      with the same capabilities as the systemd unit below (`NET_ADMIN`,
-      `BPF`, `PERFMON`, `NET_RAW`, `SYS_ADMIN`, unlimited memlock) to load
-      eBPF/XDP — it is not meant to run as an unprivileged container.
-
-    The collector and analyzer binaries/images/packages are linux/amd64 only:
-    the collector's eBPF object is compiled for the host architecture, and the
-    analyzer links against onnxruntime via cgo, so neither cross-compiles
-    cleanly without a matching cross toolchain.
-
-## Usage
-
-Start the **analyzer** first (anywhere; no root needed), then the **collector**
-on each protected host pointing at the analyzer's gRPC address. For new
-deployments, start both daemons with `-dry-run` (the analyzer's flag
-suppresses BLOCK commands; the collector's flag suppresses its own
-kernel-space drops), review logs and metrics, then roll out enforcement
-gradually after tuning thresholds and allowlists.
+Typical build:
 
 ```bash
-# Analyzer (brain) — listens for collectors on :9090, metrics on :9091
-./packetyeeter-analyzer -listen-addr 0.0.0.0:9090 -metrics-addr :9091 \
-    -geoip-asn /var/lib/GeoIP/GeoLite2-ASN.mmdb
-
-# Collector (enforcer) — root required to load eBPF
-sudo ./packetyeeter-collector -i eth0 -analyzer-addr 127.0.0.1:9090
+make
 ```
 
-### Collector Flags
-
-| Flag | Default | Description |
-| :--- | :--- | :--- |
-| `-i` | `eth0` | Network interface to attach eBPF programs to. |
-| `-analyzer-addr` | `127.0.0.1:9090` | Analyzer gRPC address to connect to. |
-| `-metrics-addr` | `:2112` | Prometheus metrics HTTP listen address. |
-| `-spoe-port` | `9876` | HAProxy SPOE agent port. |
-| `-socket` | `/var/run/packetyeeter-collector.sock` | UNIX socket for `yeetctl`. |
-| `-geoip-asn` | `""` | Path to `GeoLite2-ASN.mmdb` for ASN enrichment. |
-| `-allowlist` | `""` | Comma-separated CIDRs to bypass all filtering (IPv4/IPv6). |
-| `-policy` | `""` | Comma-separated per-CIDR policy overrides as `CIDR=action` (`block` or `monitor`), e.g. `203.0.113.0/24=block,198.51.100.0/24=monitor`. |
-| `-block-duration` | `5m` | Default duration to keep an IP blocked. |
-| `-poll-interval` | `1s` | How often to poll the eBPF maps. |
-| `-signal-queue-size` | `10000` | Collector → analyzer signal queue size. |
-| `-egress-accounting` | `false` | Enable per-client eBPF TC egress byte counters. Required for the analyzer's sustained-download **volume** path; off by default because it adds two per-client maps and a counter update per egress packet. |
-| `-egress-min-bytes` | `1048576` | Minimum bytes accumulated in one poll interval before a client is reported to the analyzer. Keeps ordinary browsing out of the signal stream. |
-| `-udp-frag-mode` | `rate` | Fragmented UDP / IPv6 Fragment policy: `rate` (default) rate-limits instead of hard-dropping solely for fragmentation; `drop` restores the legacy unconditional drop. |
-| `-dry-run` | `false` | Monitor mode: the collector's own kernel-space detections (bad flags, SYN-flood blocklist, ICMP/UDP rate limits) log/count but never drop traffic. Independent of the analyzer's `-dry-run`, which only suppresses BLOCK commands sent back over gRPC. |
-| `-v` | `false` | Verbose logging. |
-
-### Analyzer Flags
-
-| Flag | Default | Description |
-| :--- | :--- | :--- |
-| `-listen-addr` | `0.0.0.0:9090` | gRPC listen address for collectors. |
-| `-metrics-addr` | `:9091` | Prometheus metrics HTTP listen address. |
-| `-inspect-addr` | `127.0.0.1:9092` | Read-only HTTP inspector UI address. |
-| `-inspect-trusted-hosts` | `""` | Comma-separated extra Host/Origin hostnames the inspector trusts for state-mutating requests, in addition to loopback (e.g. a reverse-proxy hostname). Read-only GETs are never gated. |
-| `-geoip-asn` | `""` | Path to `GeoLite2-ASN.mmdb` for ASN enrichment. |
-| `-geoip-country` | `""` | Path to `GeoLite2-Country.mmdb` or `GeoLite2-City.mmdb` (optional). Enables country-level enrichment and the Inspector's "Threats by Country" panel; without it, country fields report "unknown". |
-| `-reputation-threshold` | `75.0` | Reputation score at which an entity is treated as a bad actor. |
-| `-reputation-max-entries` | `500000` | Max tracked reputation entries. |
-| `-reputation-max-age` | `24h` | Max age before a reputation entry is evicted. |
-| `-reputation-asn-max-hosts` | `5000` | Max tracked hosts per ASN. |
-| `-reputation-ip-score-cap` | `200` | Max accumulated IP reputation score. `0` = uncapped. |
-| `-reputation-ja4-score-cap` | `200` | Max accumulated JA4 reputation score. `0` = uncapped. |
-| `-reputation-asn-score-cap` | `500` | Max accumulated ASN reputation score. `0` = uncapped. |
-| `-ai-confidence-threshold` | `0.7` | Minimum AI confidence in `(0,1]` to flag a bot/scraper. Also the bar the ML model must clear to confirm a reputation-threshold block when `-ml-model` is set. |
-| `-ai-workers` | `16` | AI detection worker pool size. |
-| `-ai-queue-size` | `10000` | AI detection queue size. |
-| `-max-collectors` | `1024` | Maximum concurrent collector streams. Bounds fan-out and goroutines on the unauthenticated signal plane. |
-| `-ml-model` | `""` | Optional path to an ONNX ML model. When set, reputation-threshold blocks must additionally be confirmed by the model at `-ai-confidence-threshold`. When unset, no ML gate is applied to blocking. |
-| `-ddos-min-incomplete` | `400` | Min incomplete handshakes for a DDoS categorization. |
-| `-ddos-min-pattern` | `800` | Min pattern matches for a DDoS categorization. |
-| `-ddos-min-total` | `1500` | Min total events for a DDoS categorization. |
-| `-ddos-require-highfreq` | `true` | Require high-frequency traffic for DDoS categorization. |
-| `-disable-ddos-category` | `false` | Disable the DDoS categorization path. |
-| `-enable-high-cardinality-metrics` | `false` | Emit per-IP, per-JA4H, and exact-ASN/org high-cardinality metrics. |
-| `-enable-pprof` | `false` | Enable the pprof HTTP server. |
-| `-pprof-addr` | `:6060` | pprof listen address. |
-| `-sustained-enabled` | `false` | Enable sustained-download detection (measurement only; see `-sustained-enforce`). |
-| `-sustained-enforce` | `false` | Turn sustained-download decisions into BLOCK commands. Deliberately separate from `-sustained-enabled` so a deployment can run detect-only for as long as tuning takes. |
-| `-sustained-window-seconds` | `300` | Sliding window length. |
-| `-sustained-evaluation-interval-seconds` | `10` | How often tracked clients are evaluated. |
-| `-sustained-publish-interval-seconds` | `60` | Minimum gap between decisions for the same client. |
-| `-sustained-min-requests` | `1000` | Minimum requests in the window (both paths). |
-| `-sustained-min-bytes` | `5368709120` | Minimum egress bytes in the window. **Volume path only** — the shape path has no byte floor. Needs collector `-egress-accounting`. |
-| `-sustained-min-resources` | `500` | Minimum distinct resources in the window (both paths). Not raised by reputation. |
-| `-sustained-min-sections` | `100` | Minimum distinct sections (host + first path segment) in the window (both paths). Not raised by reputation. |
-| `-sustained-max-resources-per-section-percent` | `120` | Shape-path ceiling on the resources-per-section ratio, as a percentage. Below it a client is spreading thinly across sections (enumeration); above it, concentrating (ordinary deep usage). |
-| `-sustained-max-clients` | `20000` | Maximum clients tracked concurrently. A growing `packetyeeter_sustained_client_evictions_total` means detection is only being applied to an arbitrary subset. |
-| `-sustained-max-resources-per-client` | `500` | Maximum distinct resources retained per client. `0` uses the resource minimum. |
-| `-sustained-hold-seconds` | `600` | How long a selected client stays selected after it stops clearing thresholds, since blocking destroys the byte evidence. Negative disables the hold. |
-| `-sustained-max-hold-seconds` | `1200` | Hard ceiling on the hold. This is the only bound on the cost of a false positive. |
-| `-sustained-release-factor-percent` | `100` | Percentage of the thresholds a held client must stay above (on requests, resources and sections) to remain held. |
-| `-sustained-reputation-factor` | `4` | Multiplier applied to the request and byte floors for verified good-reputation clients. Resource and section floors are unaffected. |
-| `-dry-run` | `false` | Log detections but do not send BLOCK commands (Monitor Mode). Also suppresses sustained-download blocks. |
-| `-v` | `false` | Verbose logging. |
-
-> Threat intelligence uses the free, **keyless** Shodan InternetDB API — no API key is required.
-
-## Observability & Dashboard
-
-PacketYeeter is designed to be monitored via **Prometheus** and **Grafana**.
-
-1.  **Metrics Endpoints**:
-    *   Collector: `http://<collector-host>:2112/metrics`
-    *   Analyzer: `http://<analyzer-host>:9091/metrics`
-
-    All metrics are prefixed `packetyeeter_`. Key series include:
-
-    *   `packetyeeter_tcp_blocks_total`, `packetyeeter_udp_blocks_total`, `packetyeeter_icmp_blocks_total`, `packetyeeter_haproxy_blocks_total`: blocks by protocol/source.
-    *   `packetyeeter_tcp_syn_flood_blocks_total`: SYN flood blocks.
-    *   `packetyeeter_tcp_bad_flags_blocks_total`: invalid TCP flag blocks.
-    *   `packetyeeter_kernel_incidents_total{reason}`: structured kernel-space incident records (collector endpoint), broken down by reason (`blocked_ip`, `policy_block`, `icmp_rate`, `udp_rate`, `udp_frag`, `bad_flags`). See "Structured Incident Logging" above.
-    *   `packetyeeter_udp_max_rate_pps`, `packetyeeter_icmp_max_rate_pps`: peak UDP/ICMP PPS.
-    *   `packetyeeter_ja4t_suspicious_total`: suspicious JA4T abuse events.
-    *   `packetyeeter_high_latency_handshakes_total`, `packetyeeter_high_latency_max_ms`, `packetyeeter_latency_ewma_by_asn_ms`: JA4L latency signals.
-    *   `packetyeeter_proxy_lag_max_ms`, `packetyeeter_proxy_lag_ewma_by_asn_ms`, `packetyeeter_client_req_time_ms`: SPOE / proxy-lag signals.
-    *   `packetyeeter_reputation_score`: current reputation score per entity.
-    *   `packetyeeter_ai_signals_total`, `packetyeeter_ai_detections_total` (plus `_by_asn`, `_by_ja4h`, `_by_ip`, `_by_type` variants): AI bot/scraper signals and detections.
-    *   `packetyeeter_attack_campaign_detections_total`, `packetyeeter_active_attack_campaigns`, `packetyeeter_carpet_bombing_detections_total`, `packetyeeter_campaign_baseline_*`: observe-only DDoS campaign and adaptive baseline signals.
-    *   `packetyeeter_ml_*`, `packetyeeter_ja4db_*`, `packetyeeter_bot_verification_*`, `packetyeeter_threat_intel_*`, `packetyeeter_rate_limit_*`: ML inference, JA4DB, bot verification, threat-intel, and rate-limiter metrics.
-
-    See [`docs/observability.md`](docs/observability.md) for the full metric catalog and dashboard panel mappings.
-
-2.  **Inspector UI**:
-    The analyzer serves a read-only web inspector at `http://127.0.0.1:9092`
-    (`-inspect-addr`) for live inspection of sessions, detections, and reputation.
-    Keep it bound to loopback or behind trusted access controls.
-
-3.  **Grafana Dashboards**:
-    Two dashboards are included, both built against an InfluxDB data source:
-    `grafana-dashboard.json` (full detail) and `grafana-dashboard.influx.json`
-    (condensed overview). Import either and select your InfluxDB data source for
-    the `DS_INFLUXDB` variable. The default dashboards exclude IPs; panels that
-    depend on `-enable-high-cardinality-metrics` stay empty until that flag is
-    set, and per-IP breakdowns belong in a private dashboard. See
-    [`examples/prometheus-scrape.yml`](examples/prometheus-scrape.yml) for a
-    minimal Prometheus scrape config and
-    [`examples/prometheus-alerts.yml`](examples/prometheus-alerts.yml) for
-    example alert rules.
-
-4.  **Logs**:
-    Logs are output in structured JSON format, e.g.:
-    ```json
-    {"action":"WOULD BLOCK (Dry Run)","ip":"192.0.2.15","level":"warning","msg":"Rate Limit Exceeded","pps":5323,"reason":"rate_limit_exceeded","time":"..."}
-    ```
-
-## Management CLI (`yeetctl`)
-
-`yeetctl` inspects the **collector**'s state over its UNIX socket. Both the
-collector and `yeetctl` default to `/var/run/packetyeeter-collector.sock`; use
-`-socket` on the collector or `-sock` on `yeetctl` to override it.
+If you only want the collector:
 
 ```bash
-SOCK=/var/run/packetyeeter-collector.sock
-
-# List currently blocked IPs and their remaining TTL
-sudo ./yeetctl -sock $SOCK list
-
-# View current reputation scores (entities with score > 0)
-sudo ./yeetctl -sock $SOCK reputation
-
-# Show AI detection summaries (by IP, JA4H, ASN)
-sudo ./yeetctl -sock $SOCK ai
-
-# Show verified/unverified bot activity
-sudo ./yeetctl -sock $SOCK bots
+make collector
 ```
 
-The collector reports blocked IPs directly from its eBPF maps. Reputation, AI,
-and bot summaries currently return empty collector-side state until analyzer
-state is exposed over the management API.
+## Run
 
-For an interactive live view, run `yeetexplorer` (a terminal UI dashboard).
+Example:
 
-## Running as a Service (Systemd)
+```bash
+sudo ./packetyeeter-collector -i eth0
+```
 
-PacketYeeter ships two systemd units — one per daemon. `make install-services`
-copies them into place, or install manually:
+## `yeetctl`
 
-1.  **Install binaries**:
-    ```bash
-    sudo mkdir -p /opt/packetyeeter/collector /opt/packetyeeter/analyzer
-    sudo cp packetyeeter-collector /opt/packetyeeter/collector/
-    sudo cp packetyeeter-analyzer  /opt/packetyeeter/analyzer/
-    ```
+`yeetctl` talks to the collector over its UNIX socket.
 
-2.  **Install config & units**:
-    ```bash
-    sudo cp packetyeeter-collector.default /etc/default/packetyeeter-collector
-    sudo cp packetyeeter-analyzer.default  /etc/default/packetyeeter-analyzer
-    sudo cp packetyeeter-collector.service /etc/systemd/system/
-    sudo cp packetyeeter-analyzer.service  /etc/systemd/system/
-    ```
+Examples:
 
-3.  **Configure**:
-    Edit `/etc/default/packetyeeter-collector` (interface, analyzer address, allowlist, …)
-    and `/etc/default/packetyeeter-analyzer` (listen address, GeoIP path, …).
-    The collector runs with `CAP_SYS_ADMIN/NET_ADMIN/BPF/PERFMON/NET_RAW` and
-    `LimitMEMLOCK=infinity`; the analyzer runs hardened (`NoNewPrivileges`,
-    `ProtectSystem=strict`, `ReadWritePaths=/var/lib/packetyeeter`).
-    Avoid removing collector capabilities or adding restrictive device/network
-    hardening unless BPF load, XDP attach, TC attach, and map access have been
-    validated on the target kernel.
+```bash
+sudo ./yeetctl list
+sudo ./yeetctl whitelist
+```
 
-4.  **Enable & start** (start the analyzer first; the collector `Wants` it):
-    ```bash
-    sudo systemctl daemon-reload
-    sudo systemctl enable --now packetyeeter-analyzer
-    sudo systemctl enable --now packetyeeter-collector
-    ```
+## Notes
 
-5.  **View logs**:
-    ```bash
-    journalctl -u packetyeeter-collector -f
-    journalctl -u packetyeeter-analyzer -f
-    ```
+- Linux is required for the collector.
+- Root privileges or equivalent capabilities are required to load and attach eBPF programs.
+- This README is intentionally minimal and describes this simplified fork, not the original multi-component design.
 
-## Testing Scripts
+## Upstream project
 
-The `scripts/` directory contains Python/Scapy utilities to test detection and
-tooling for the ML pipeline:
+If you want the original architecture, advanced features, or fuller documentation, use the upstream repository:
 
-*   **SYN Flood**: `python3 scripts/flood_test.py <TargetIP> --count 500`
-*   **Bad Flags**: `python3 scripts/flag_test.py <TargetIP> --count 20`
-*   **ML pipeline**: training/evaluation helpers such as `train_model.py`,
-    `train_advanced_model.py`, `evaluate_model.py`, and `sessions_to_training.py`.
+- https://github.com/awlx/packetyeeter
 
 ## License
 
-PacketYeeter is licensed under **GPL-2.0** (required for Kernel BPF compatibility).
-The full license text is available in [`LICENSE`](LICENSE).
-
-### Third-Party Algorithm Licensing (JA4+)
-
-PacketYeeter implements fingerprinting derived from the **JA4+ suite**
-(JA4H, JA4T, JA4L). These algorithms originate from
-[FoxIO-LLC/ja4](https://github.com/FoxIO-LLC/ja4) and are subject to the
-**FoxIO License 1.1**, which is separate from and additional to the GPL-2.0
-license covering PacketYeeter's own code:
-
-*   The original **JA4** (TLS client) algorithm is BSD-3-Clause licensed.
-*   The **JA4+ algorithms** (including JA4H/JA4T/JA4L) are licensed under the
-    [FoxIO License 1.1](https://github.com/FoxIO-LLC/ja4/blob/main/LICENSE),
-    which permits open-source and internal use but restricts commercial
-    redistribution. If you intend to use PacketYeeter commercially, review the
-    FoxIO License terms and contact FoxIO LLC regarding the JA4+ components.
-
-See [`NOTICE`](NOTICE) for full third-party attribution.
+See [`LICENSE`](LICENSE).

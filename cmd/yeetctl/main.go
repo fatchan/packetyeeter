@@ -1,7 +1,6 @@
 package main
 
 import (
-	"PacketYeeter/pkg/analyzer/reputation"
 	"PacketYeeter/pkg/collector/ebpf"
 	"encoding/json"
 	"flag"
@@ -9,7 +8,6 @@ import (
 	"net"
 	"os"
 	"sort"
-	"time"
 )
 
 const defaultSocketPath = "/var/run/packetyeeter-collector.sock"
@@ -65,7 +63,6 @@ func main() {
 		fmt.Println("Commands:")
 		fmt.Println("  list       - List blocked IPs")
 		fmt.Println("  whitelist  - List current allowlist entries")
-		fmt.Println("  reputation - List full reputation table")
 		fmt.Println("  ai         - Show AI scraper detections summary")
 		fmt.Println("  bots       - Show bot categorization summary")
 		os.Exit(1)
@@ -143,36 +140,6 @@ func main() {
 				source = "dynamic"
 			}
 			fmt.Printf("  - %-39s [%s]\n", entry.CIDR, source)
-		}
-	} else if Command == "reputation" || Command == "scores" {
-		_, err = conn.Write([]byte("REPUTATION"))
-		if err != nil {
-			fmt.Printf("Failed to send command: %v\n", err)
-			os.Exit(1)
-		}
-
-		var entries map[string]*reputation.Entry
-		if err := json.NewDecoder(conn).Decode(&entries); err != nil {
-			fmt.Printf("Failed to read response: %v\n", err)
-			os.Exit(1)
-		}
-
-		fmt.Println("Reputation Table")
-		fmt.Printf("%-40s | %-10s | %-10s | %-20s\n", "Entity", "Score", "Offenses", "Last Seen")
-		fmt.Println("-----------------------------------------------------------------------------------------")
-
-		keys := make([]string, 0, len(entries))
-		for k := range entries {
-			keys = append(keys, k)
-		}
-		sort.Strings(keys)
-
-		for _, k := range keys {
-			e := entries[k]
-			fmt.Printf("%-40s | %-10.2f | %-10d | %-20s\n", k, e.Score, e.Offenses, e.LastSeen.Format(time.RFC822))
-		}
-		if len(keys) == 0 {
-			fmt.Println("(none; collector does not currently expose analyzer reputation state)")
 		}
 	} else if Command == "ai" {
 		type AISummary struct {
