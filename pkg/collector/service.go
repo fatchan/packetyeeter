@@ -893,12 +893,6 @@ func (c *Collector) refreshUDPRates() {
 			if rate.Count == 0 {
 				continue
 			}
-			ipBytes := make([]byte, 4)
-			binary.LittleEndian.PutUint32(ipBytes, ip)
-			ipAddr := net.IP(ipBytes)
-			if c.Maps.IsHTTP3SeenIP(ipAddr) {
-				continue
-			}
 			totalPPS += computePPS(c.prevUDPRates, ip, rate)
 		}
 	}
@@ -909,10 +903,6 @@ func (c *Collector) refreshUDPRates() {
 		iter := c.Maps.UDPRatesV6.Iterate()
 		for iter.Next(&key, &rate) {
 			if rate.Count == 0 {
-				continue
-			}
-			ipAddr := net.IP(key[:])
-			if c.Maps.IsHTTP3SeenIP(ipAddr) {
 				continue
 			}
 			totalPPS += computePPSV6(c.prevUDPRatesV6, key, rate)
