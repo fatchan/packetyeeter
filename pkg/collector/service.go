@@ -1568,6 +1568,12 @@ func (c *Collector) startCollectorMetricsServer() *http.Server {
 	registry.MustRegister(metrics.PerfLostSamples)
 	registry.MustRegister(metrics.IncompleteHandshakeBlocks)
 
+    for reason := uint32(1); reason < uint32(ebpf.IncidentMax); reason++ {
+        name := ebpf.IncidentReasonName(uint8(reason))
+        metrics.KernelIncidents.WithLabelValues(name).Add(0)
+        metrics.KernelDroppedPacketsExact.WithLabelValues(name).Add(0)
+    }
+
 	metrics.PerfLostSamples.WithLabelValues("tcp_metadata").Add(0)
 	metrics.PerfLostSamples.WithLabelValues("incidents").Add(0)
 
