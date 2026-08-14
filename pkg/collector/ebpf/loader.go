@@ -19,10 +19,10 @@ import (
 var bpfFS embed.FS
 
 type tcAttachment struct {
-	ifaceName      string
-	ifaceIndex     int
-	ingressFilter  *netlink.BpfFilter
-	egressFilter   *netlink.BpfFilter
+	ifaceName     string
+	ifaceIndex    int
+	ingressFilter *netlink.BpfFilter
+	egressFilter  *netlink.BpfFilter
 }
 
 type Loader struct {
@@ -90,7 +90,6 @@ func (l *Loader) Load() error {
 		HTTP3SeenIPsV6:              l.coll.Maps["http3_seen_ips_v6"],
 		AllowListV4:                 l.coll.Maps["allowlist_v4"],
 		AllowListV6:                 l.coll.Maps["allowlist_v6"],
-		Events:                      l.coll.Maps["events"],
 		Incidents:                   l.coll.Maps["incidents"],
 		IncidentDropCounts:          l.coll.Maps["incident_drop_counts"],
 	}

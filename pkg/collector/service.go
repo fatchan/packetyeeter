@@ -75,7 +75,6 @@ type Collector struct {
 	allowedNets        []*net.IPNet
 	dynamicAllowedNets map[string]*net.IPNet
 	allowlistMu        sync.RWMutex
-	perfReader         *perf.Reader
 	incidentReader     *perf.Reader
 
 	// Previous rates to compute pps across windows (monotonic timestamps)
@@ -93,10 +92,6 @@ type Collector struct {
 	// only newly observed kernel events.
 	prevBadFlagsSeen   map[uint32]uint64
 	prevBadFlagsSeenV6 map[[16]byte]uint64
-
-	// SYN timestamp cache retained for local correlation/cleanup symmetry.
-	synCache    sync.Map
-	synCacheTTL time.Duration
 
 	// Aggregate high-volume incident logs by reason to keep logging cheap
 	// while preserving exact Prometheus counters.
@@ -155,7 +150,6 @@ func New(cfg Config, logger *logrus.Logger) (*Collector, error) {
 	c := &Collector{
 		Config:                 cfg,
 		Logger:                 logger,
-		synCacheTTL:            60 * time.Second,
 		prevICMPRates:          make(map[uint32]prevRate),
 		prevUDPRates:           make(map[uint32]prevRate),
 		prevICMPRatesV6:        make(map[[16]byte]prevRate),
@@ -241,10 +235,6 @@ func (c *Collector) Start(ctx context.Context) error {
 		}
 	}
 
-	if err := c.startPerfEventReader(); err != nil {
-		c.Logger.WithError(err).Warn("Failed to start perf event reader")
-	}
-
 	if err := c.startIncidentReader(); err != nil {
 		c.Logger.WithError(err).Warn("Failed to start incident event reader, structured incident logging will be unavailable")
 	}
@@ -275,9 +265,6 @@ func (c *Collector) Start(ctx context.Context) error {
 
 	c.wg.Add(1)
 	go c.pollMaps()
-
-	c.wg.Add(1)
-	go c.cleanupSynCache()
 
 	c.wg.Add(1)
 	go c.runBlockGC()
@@ -330,10 +317,6 @@ func (c *Collector) Stop() {
 	}
 
 	c.stopManagementSocket()
-
-	if c.perfReader != nil {
-		c.perfReader.Close()
-	}
 
 	if c.incidentReader != nil {
 		c.incidentReader.Close()
@@ -400,78 +383,6 @@ func (c *Collector) pollMaps() {
 				lastKernelStateGC = time.Now()
 			}
 		}
-	}
-}
-
-func (c *Collector) startPerfEventReader() error {
-	if c.Maps == nil || c.Maps.Events == nil {
-		return fmt.Errorf("events map not available")
-	}
-
-	reader, err := perf.NewReader(c.Maps.Events, 4096*16)
-	if err != nil {
-		return fmt.Errorf("failed to create perf reader: %w", err)
-	}
-
-	c.perfReader = reader
-	c.wg.Add(1)
-	go c.readPerfEvents()
-
-	c.Logger.Info("Started perf event reader for local TCP metadata observation")
-	return nil
-}
-
-func (c *Collector) readPerfEvents() {
-	defer c.wg.Done()
-
-	for {
-		select {
-		case <-c.ctx.Done():
-			return
-		default:
-		}
-
-		record, err := c.perfReader.Read()
-		if err != nil {
-			if c.ctx.Err() != nil {
-				return
-			}
-			c.Logger.WithError(err).Debug("Error reading perf event")
-			continue
-		}
-		c.recordPerfLostSamples("tcp_metadata", record.LostSamples)
-
-		c.processPerfEvent(record.RawSample)
-	}
-}
-
-func (c *Collector) processPerfEvent(data []byte) {
-	var meta ebpf.EventMetadata
-	reader := bytes.NewReader(data)
-	if err := binary.Read(reader, binary.LittleEndian, &meta); err != nil {
-		c.Logger.WithError(err).Debug("Failed to parse perf event")
-		return
-	}
-
-	var ip net.IP
-	if meta.IsV6 == 1 {
-		ip = net.IP(meta.SaddrV6[:])
-	} else {
-		ipBytes := make([]byte, 4)
-		binary.LittleEndian.PutUint32(ipBytes, meta.SaddrV4)
-		ip = net.IP(ipBytes)
-	}
-
-	if c.checkAllowlist(ip) {
-		return
-	}
-
-	if meta.Type == 1 && (meta.TcpFlags&0x02) != 0 && (meta.TcpFlags&0x10) == 0 {
-		c.storeSynTimestamp(ip)
-		c.Logger.WithFields(logrus.Fields{
-			"ip":        ip.String(),
-			"tcp_flags": fmt.Sprintf("0x%02x", meta.TcpFlags),
-		}).Debug("Stored SYN timestamp for local TCP metadata correlation")
 	}
 }
 
@@ -616,37 +527,6 @@ func readPerCPUCounter(m *cebpf.Map, key uint32) (uint64, error) {
 		total += v
 	}
 	return total, nil
-}
-
-func (c *Collector) storeSynTimestamp(ip net.IP) {
-	c.synCache.Store(ip.String(), time.Now())
-}
-
-func (c *Collector) cleanupSynCache() {
-	defer c.wg.Done()
-	ticker := time.NewTicker(30 * time.Second)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-c.ctx.Done():
-			return
-		case <-ticker.C:
-			now := time.Now()
-			expired := 0
-			c.synCache.Range(func(key, value interface{}) bool {
-				ts, ok := value.(time.Time)
-				if ok && now.Sub(ts) > c.synCacheTTL {
-					c.synCache.Delete(key)
-					expired++
-				}
-				return true
-			})
-			if expired > 0 {
-				c.Logger.WithField("expired", expired).Debug("Cleaned up expired SYN timestamps")
-			}
-		}
-	}
 }
 
 // pendingHandshakeTimeout is the collector-side recentness window for deciding
@@ -1123,12 +1003,12 @@ func ipNetFromIP(ip net.IP) *net.IPNet {
 }
 
 const (
-	prevStateStaleWindowNs       uint64        = 300 * 1_000_000_000
-	prevStateHardCap                           = 1 << 18
-	kernelStateExpiryRate       time.Duration = 10 * time.Minute
-	kernelStateExpiryBadFlags   time.Duration = 10 * time.Minute
-	kernelStateExpiryHandshake  time.Duration = 30 * time.Second
-	kernelStateCleanupInterval                = 5 * time.Minute
+	prevStateStaleWindowNs     uint64        = 300 * 1_000_000_000
+	prevStateHardCap                         = 1 << 18
+	kernelStateExpiryRate      time.Duration = 10 * time.Minute
+	kernelStateExpiryBadFlags  time.Duration = 10 * time.Minute
+	kernelStateExpiryHandshake time.Duration = 30 * time.Second
+	kernelStateCleanupInterval               = 5 * time.Minute
 )
 
 func (c *Collector) pruneStaleState() {
@@ -1568,13 +1448,12 @@ func (c *Collector) startCollectorMetricsServer() *http.Server {
 	registry.MustRegister(metrics.PerfLostSamples)
 	registry.MustRegister(metrics.IncompleteHandshakeBlocks)
 
-    for reason := uint32(1); reason < uint32(ebpf.IncidentMax); reason++ {
-        name := ebpf.IncidentReasonName(uint8(reason))
-        metrics.KernelIncidents.WithLabelValues(name).Add(0)
-        metrics.KernelDroppedPacketsExact.WithLabelValues(name).Add(0)
-    }
+	for reason := uint32(1); reason < uint32(ebpf.IncidentMax); reason++ {
+		name := ebpf.IncidentReasonName(uint8(reason))
+		metrics.KernelIncidents.WithLabelValues(name).Add(0)
+		metrics.KernelDroppedPacketsExact.WithLabelValues(name).Add(0)
+	}
 
-	metrics.PerfLostSamples.WithLabelValues("tcp_metadata").Add(0)
 	metrics.PerfLostSamples.WithLabelValues("incidents").Add(0)
 
 	mux := http.NewServeMux()

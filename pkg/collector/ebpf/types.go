@@ -73,13 +73,13 @@ type BadFlagsInfo struct {
 // Structured incident logging reason codes, matching the INCIDENT_*
 // #defines in protector.bpf.c.
 const (
-	IncidentBlockedIP   = 1
-	IncidentICMPRate    = 3
-	IncidentUDPRate     = 4
-	IncidentUDPFrag     = 5
-	IncidentBadFlags    = 6
-	IncidentMalformed   = 7
-	IncidentMax         = 8
+	IncidentBlockedIP = 1
+	IncidentICMPRate  = 3
+	IncidentUDPRate   = 4
+	IncidentUDPFrag   = 5
+	IncidentBadFlags  = 6
+	IncidentMalformed = 7
+	IncidentMax       = 8
 )
 
 // IncidentReasonName returns a human-readable name for an incident reason
@@ -113,27 +113,4 @@ type IncidentEvent struct {
 	IsV6      uint8
 	Reason    uint8
 	_         [2]byte // padding, matches struct incident_event.pad
-}
-
-// EventMetadata matches the C struct event_metadata from protector.bpf.c
-type EventMetadata struct {
-	SaddrV6        [16]byte
-	SaddrV4        uint32
-	RttUs          uint32
-	Seq            uint32
-	TsVal          uint32 // TCP timestamp value
-	TsEcr          uint32 // TCP timestamp echo reply
-	Sport          uint16
-	Dport          uint16
-	Window         uint16
-	Len            uint16
-	Mss            uint16
-	Protocol       uint8
-	Type           uint8 // 1=JA4T(SYN), 2=RTT(ACK), 3=Connection Pattern
-	IsV6           uint8
-	TTL            uint8
-	TcpFlags       uint8
-	Ipv6ExtHeaders uint8
-	HasTimestamp   uint8
-	EntropyScore   uint8 // 0-100
 }

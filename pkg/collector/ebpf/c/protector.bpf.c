@@ -299,15 +299,8 @@ struct {
     __type(value, __u32);
 } config_map SEC(".maps");
 
-// Perf Event Array for Fingerprinting
-struct {
-    __uint(type, BPF_MAP_TYPE_PERF_EVENT_ARRAY);
-    __uint(key_size, sizeof(__u32));
-    __uint(value_size, sizeof(__u32));
-} events SEC(".maps");
-
 // Perf Event Array for structured incident logging (see struct
-// incident_event above). Kept separate from `events` so userspace can
+// incident_event above). Kept separate from other state so userspace can
 // decode a single fixed struct layout per ring instead of a discriminated
 // union.
 struct {
@@ -315,29 +308,6 @@ struct {
     __uint(key_size, sizeof(__u32));
     __uint(value_size, sizeof(__u32));
 } incidents SEC(".maps");
-
-// Metadata struct
-struct event_metadata {
-    __u8  saddr_v6[16];
-    __u32 saddr_v4;
-    __u32 rtt_us;
-    __u32 seq;         // TCP sequence number for pattern analysis
-    __u32 ts_val;      // TCP timestamp value (TSval)
-    __u32 ts_ecr;      // TCP timestamp echo reply (TSecr)
-    __u16 sport;
-    __u16 dport;
-    __u16 window;
-    __u16 len;
-    __u16 mss;         // Maximum segment size (from TCP options)
-    __u8  protocol;
-    __u8  type;        // 1 = JA4T (SYN), 2 = RTT (ACK), 3 = Connection Pattern
-    __u8  is_v6;
-    __u8  ttl;
-    __u8  tcp_flags;   // Raw TCP flags byte for analysis
-    __u8  ipv6_ext_headers; // Count of IPv6 extension headers
-    __u8  has_timestamp;    // 1 if TCP timestamp option present
-    __u8  entropy_score;    // Payload entropy estimate (0-100)
-};
 
 // --- Helpers ---
 
@@ -508,7 +478,7 @@ static __always_inline __u32 tcp_flags_raw(struct tcphdr *tcp) {
 // before use. Returns NULL if the header cannot be located. Locating TCP at a
 // fixed 20-byte offset (ignoring IHL) reads IP option bytes as TCP flags, which
 // lets a SYN+FIN/Xmas/NULL scan carrying a single IP option evade
-// check_tcp_flags (and corrupts JA4T/timestamp parsing in the TC path).
+// check_tcp_flags.
 static __always_inline struct tcphdr *ipv4_tcp_header(struct iphdr *ip, void *data_end) {
     __u32 ihl = ip->ihl;
     if (ihl < 5 || ihl > 15)
@@ -520,13 +490,12 @@ static __always_inline struct tcphdr *ipv4_tcp_header(struct iphdr *ip, void *da
 }
 
 // Per-CPU emission budgets. Under a multi-Mpps flood the program would
-// otherwise call bpf_perf_event_output once per dropped packet (incidents) and
-// once per SYN (events), saturating the perf ring - which drops events for
-// everyone and burns CPU on the per-event copy and wakeup - exactly when the
-// host is most loaded. These cap telemetry emits per CPU per 1s window;
-// enforcement (the XDP_DROP itself, and the handshake tracking) is unaffected,
-// only the audit/telemetry stream is sampled. Per-CPU so there is no
-// cross-core contention on the counter.
+// otherwise call bpf_perf_event_output once per dropped packet (incidents),
+// saturating the perf ring - which drops events for everyone and burns CPU on
+// the per-event copy and wakeup - exactly when the host is most loaded. These
+// cap telemetry emits per CPU per 1s window; enforcement (the XDP_DROP itself)
+// is unaffected, only the audit/telemetry stream is sampled. Per-CPU so there
+// is no cross-core contention on the counter.
 #define MAX_EMITS_PER_SEC_PER_CPU 1000
 
 struct emit_budget {
@@ -540,13 +509,6 @@ struct {
     __type(key, __u32);
     __type(value, struct emit_budget);
 } incident_budget SEC(".maps");
-
-struct {
-    __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
-    __uint(max_entries, 1);
-    __type(key, __u32);
-    __type(value, struct emit_budget);
-} event_budget SEC(".maps");
 
 // emit_allowed returns whether a telemetry emit is within this CPU's per-second
 // budget, advancing the window and count. Fails open (emits) if the budget map
@@ -618,188 +580,6 @@ static __always_inline void emit_incident_v6(struct xdp_md *ctx, struct in6_addr
     inc.is_v6 = 1;
     inc.reason = reason;
     bpf_perf_event_output(ctx, &incidents, BPF_F_CURRENT_CPU, &inc, sizeof(inc));
-}
-
-// Parse TCP timestamp option
-// Returns 1 if timestamp found, 0 otherwise
-//
-// The option walk is bounded to a small, fixed number of iterations. It is
-// inlined into the TC ingress SYN paths for both IPv4 and IPv6, and PR #63
-// changed the IPv4 caller to locate the TCP header via the variable IHL offset
-// (ipv4_tcp_header) rather than a fixed 20-byte offset - correct, but it feeds a
-// variable-offset base into this loop. The per-iteration branch states of a
-// variable-length option walk grow steeply with the iteration count, and at 10
-// iterations (inlined twice) the TC ingress program tipped over the verifier's
-// 1M-processed-instruction limit ("BPF program is too large"). Real TCP SYNs put
-// the timestamp option within the first few options (Linux/Windows/macOS all
-// place it at or before position ~6), so scanning the first
-// TCP_TS_MAX_OPTIONS options finds it in practice while keeping the program
-// comfortably within the verifier budget. Kept inlined (not a BPF-to-BPF
-// subprogram): passing PTR_TO_PACKET to a subprogram is only reliably
-// verifiable on Linux 5.10+, and this project targets Linux 5.4+.
-#define TCP_TS_MAX_OPTIONS 8
-static __always_inline int parse_tcp_timestamp(struct tcphdr *tcp, void *data_end, __u32 *ts_val, __u32 *ts_ecr) {
-    // Initialize outputs
-    *ts_val = 0;
-    *ts_ecr = 0;
-
-    // Critical: Verify TCP header is within packet bounds before ANY field access
-    // The verifier loses context when tcp pointer is passed to this function
-    if ((void *)tcp + sizeof(struct tcphdr) > data_end) {
-        return 0;
-    }
-
-    // TCP header length in bytes
-    __u32 tcp_hdr_len = tcp->doff * 4;
-    
-    // Sanity check: minimum TCP header is 20 bytes
-    if (tcp_hdr_len < 20 || tcp_hdr_len > 60) {
-        return 0;
-    }
-
-    // Options start after fixed 20-byte header
-    // Use struct pointer arithmetic for verifier
-    __u8 *options = (__u8 *)(tcp + 1);
-    
-    // Calculate options length (header length - fixed 20 bytes)
-    __u32 options_len = tcp_hdr_len - 20;
-    
-    // CRITICAL: Bounds check - if no options, return early
-    if (options_len == 0) {
-        return 0;
-    }
-    
-    // Verify we can read at least 1 byte of options
-    if (options + 1 > (__u8 *)data_end) {
-        return 0;
-    }
-    
-    __u8 *options_end = options + options_len;
-
-    // Ensure options_end doesn't exceed packet bounds
-    if (options_end > (__u8 *)data_end) {
-        return 0;
-    }
-
-    // Parse options with bounded loop for verifier
-    // Manual unroll to avoid verifier issues
-    int found = 0;
-    
-    #pragma unroll
-    for (int i = 0; i < TCP_TS_MAX_OPTIONS; i++) {
-        // Skip if already found
-        if (found) {
-            continue;
-        }
-        
-        // Bounds checks first
-        if (options >= options_end || options + 1 > (__u8 *)data_end) {
-            continue;
-        }
-
-        __u8 kind = *options;
-
-        // End of options list
-        if (kind == 0) {
-            continue;
-        }
-
-        // NOP (1-byte option)
-        if (kind == 1) {
-            options++;
-            continue;
-        }
-
-        // All other options have length field
-        if (options + 2 > (__u8 *)data_end) {
-            continue;
-        }
-
-        __u8 len = *(options + 1);
-        
-        // Validate length
-        if (len < 2) {
-            continue;
-        }
-
-        // TCP Timestamp option (kind=8, len=10)
-        if (kind == 8 && len == 10 && options + 10 <= (__u8 *)data_end) {
-            // Read TSval (bytes 2-5)
-            *ts_val = bpf_ntohl(*(__u32 *)(options + 2));
-            
-            // Read TSecr (bytes 6-9)
-            *ts_ecr = bpf_ntohl(*(__u32 *)(options + 6));
-            
-            found = 1;
-        }
-
-        // Advance to next option (with bounds check)
-        if (len <= 40 && options + len <= options_end) {
-            options += len;
-        } else {
-            break;
-        }
-    }
-
-    return found;
-}
-
-// Simplified payload entropy estimation
-// Returns entropy score 0-100 (0=very low, 100=high/uniform)
-// This is NOT true Shannon entropy (too complex for eBPF), but a heuristic:
-// - Count unique bytes in first N bytes of payload
-// - Detect repeated patterns
-// - Return approximation suitable for bot detection
-static __always_inline __u8 estimate_payload_entropy(void *payload_start, void *data_end, __u16 max_bytes) {
-    if (max_bytes > 64) max_bytes = 64; // Limit for eBPF complexity
-    
-    __u8 *payload = (__u8 *)payload_start;
-    __u8 byte_seen[256] = {0}; // Track which byte values appear
-    __u16 unique_count = 0;
-    __u16 total_count = 0;
-    __u8 prev_byte = 0;
-    __u16 repeat_count = 0;
-    
-    // Sample up to max_bytes
-    #pragma unroll
-    for (int i = 0; i < 64; i++) {
-        if (i >= max_bytes) break;
-        if (payload + i >= (__u8 *)data_end) break;
-        
-        __u8 byte = payload[i];
-        total_count++;
-        
-        // Track unique bytes
-        if (byte_seen[byte] == 0) {
-            byte_seen[byte] = 1;
-            unique_count++;
-        }
-        
-        // Detect repeating bytes (low entropy indicator)
-        if (i > 0 && byte == prev_byte) {
-            repeat_count++;
-        }
-        prev_byte = byte;
-    }
-    
-    if (total_count == 0) return 50; // No data, neutral score
-    
-    // Calculate score based on unique byte ratio and repetition
-    // High unique ratio = high entropy
-    // Low repetition = higher entropy
-    __u32 unique_ratio = (unique_count * 100) / total_count;
-    __u32 repeat_ratio = (repeat_count * 100) / total_count;
-    
-    // Score: unique ratio minus penalty for repetition
-    __u32 score = unique_ratio;
-    if (repeat_ratio > 50) {
-        score = score / 2; // Heavy penalty for >50% repetition
-    } else {
-        score = score - (repeat_ratio / 2);
-    }
-    
-    if (score > 100) score = 100;
-    return (__u8)score;
 }
 
 // Count IPv6 extension headers
@@ -1173,58 +953,6 @@ int tc_ingress_syn_monitor(struct __sk_buff *skb) {
             key.sport = tcp->source;
             key.dport = tcp->dest;
 
-            // Submit for JA4T Analysis
-            __u16 pkt_len = (__u16)(data_end - data);
-            
-            // Limit capture size to avoid overhead (e.g. 128 bytes usually enough for TCP options)
-            __u16 capture_len = pkt_len; 
-            if (capture_len > 128) capture_len = 128; 
-
-            __u64 flags = BPF_F_CURRENT_CPU | ((__u64)capture_len << 32);
-
-            // Limited metadata
-            struct event_metadata meta = {};
-            meta.saddr_v4 = ip->saddr;
-            meta.is_v6 = 0;
-            meta.sport = tcp->source;
-            meta.dport = tcp->dest;
-            meta.protocol = IPPROTO_TCP;
-            meta.type = 1; // JA4T
-            meta.window = bpf_ntohs(tcp->window);
-            meta.len = pkt_len; 
-            meta.rtt_us = 0;
-            meta.ttl = ip->ttl;
-            meta.seq = bpf_ntohl(tcp->seq);
-            meta.tcp_flags = (tcp->fin) | (tcp->syn << 1) | (tcp->rst << 2) | 
-                            (tcp->psh << 3) | (tcp->ack << 4) | (tcp->urg << 5);
-            
-            // MSS parsing disabled for now (eBPF verifier complexity)
-            meta.mss = 0;
-            
-            // TCP timestamp parsing - ENABLED for clock skew detection.
-            // Uses the IHL-correct header; the option walk in
-            // parse_tcp_timestamp is bounded (TCP_TS_MAX_OPTIONS) so the
-            // variable IHL base does not blow the verifier's instruction budget.
-            __u32 ts_val = 0, ts_ecr = 0;
-            if (parse_tcp_timestamp(tcp, data_end, &ts_val, &ts_ecr)) {
-                meta.has_timestamp = 1;
-                meta.ts_val = ts_val;
-                meta.ts_ecr = ts_ecr;
-            } else {
-                meta.has_timestamp = 0;
-                meta.ts_val = 0;
-                meta.ts_ecr = 0;
-            }
-
-            // IPv6 extension headers (always 0 for IPv4)
-            meta.ipv6_ext_headers = 0;
-
-            // Sample per-SYN JA4T emits to the per-CPU budget so a SYN flood
-            // cannot saturate the perf ring; the handshake tracking below still
-            // runs for every SYN.
-            if (emit_allowed(&event_budget, bpf_ktime_get_ns()))
-                bpf_perf_event_output(skb, &events, flags, &meta, sizeof(meta));
-
             __u64 now = bpf_ktime_get_ns();
             struct handshake_status *existing = bpf_map_lookup_elem(&pending_handshakes, &key);
             if (!existing) {
@@ -1244,24 +972,6 @@ int tc_ingress_syn_monitor(struct __sk_buff *skb) {
             
             struct handshake_status *existing = bpf_map_lookup_elem(&pending_handshakes, &key);
             if (existing && existing->synack_sent) {
-                // Calculate RTT
-                if (existing->synack_time > 0) {
-                     __u64 now = bpf_ktime_get_ns();
-                     if (now > existing->synack_time) {
-                         __u64 rtt_ns = now - existing->synack_time;
-                         struct event_metadata meta = {};
-                         meta.saddr_v4 = ip->saddr;
-                         meta.is_v6 = 0;
-                         meta.sport = tcp->source;
-                         meta.dport = tcp->dest;
-                         meta.protocol = IPPROTO_TCP;
-                         meta.type = 2; // JA4L / RTT
-                         meta.rtt_us = (__u32)(rtt_ns / 1000);
-                         meta.ttl = ip->ttl;
-                         
-                         bpf_perf_event_output(skb, &events, BPF_F_CURRENT_CPU, &meta, sizeof(meta));
-                     }
-                }
                 __u64 now = bpf_ktime_get_ns();
                 bpf_map_delete_elem(&pending_handshakes, &key);
                 decrement_incomplete_handshake_count_v4(key.saddr, now);
@@ -1282,56 +992,6 @@ int tc_ingress_syn_monitor(struct __sk_buff *skb) {
             key.daddr = ip6->daddr;
             key.sport = tcp->source;
             key.dport = tcp->dest;
-            
-            // JA4T V6
-            __u16 pkt_len = (__u16)(data_end - data);
-            __u16 capture_len = pkt_len; 
-            if (capture_len > 128) capture_len = 128;
-            
-            __u64 flags = BPF_F_CURRENT_CPU | ((__u64)capture_len << 32);
-
-            struct event_metadata meta = {};
-            // We can't fit v6 saddr in u32 saddr field easily without changing struct. 
-            // Reuse saddr as "0" to indicate v6 and let userspace parse from payload? 
-            // Or use perf_event's raw data which includes IP header.
-            meta.type = 1;
-            meta.protocol = IPPROTO_TCP;
-            meta.window = bpf_ntohs(tcp->window);
-            meta.len = pkt_len;
-            meta.rtt_us = 0;
-            
-            // V6 Handling
-            __builtin_memcpy(meta.saddr_v6, &ip6->saddr, 16);
-            meta.is_v6 = 1;
-            meta.saddr_v4 = 0;
-            meta.ttl = ip6->hop_limit;
-            meta.seq = bpf_ntohl(tcp->seq);
-            meta.tcp_flags = (tcp->fin) | (tcp->syn << 1) | (tcp->rst << 2) | 
-                            (tcp->psh << 3) | (tcp->ack << 4) | (tcp->urg << 5);
-            
-            // MSS parsing disabled for now (eBPF verifier complexity)
-            meta.mss = 0;
-            
-            // TCP timestamp parsing - ENABLED for clock skew detection
-            __u32 ts_val = 0, ts_ecr = 0;
-            if (parse_tcp_timestamp(tcp, data_end, &ts_val, &ts_ecr)) {
-                meta.has_timestamp = 1;
-                meta.ts_val = ts_val;
-                meta.ts_ecr = ts_ecr;
-            } else {
-                meta.has_timestamp = 0;
-                meta.ts_val = 0;
-                meta.ts_ecr = 0;
-            }
-            
-            // IPv6 extension header counting disabled (eBPF verifier complexity)
-            meta.ipv6_ext_headers = 0;
-
-            // Sample per-SYN JA4T emits to the per-CPU budget so a SYN flood
-            // cannot saturate the perf ring; the handshake tracking below still
-            // runs for every SYN.
-            if (emit_allowed(&event_budget, bpf_ktime_get_ns()))
-                bpf_perf_event_output(skb, &events, flags, &meta, sizeof(meta));
 
             __u64 now = bpf_ktime_get_ns();
             struct handshake_status *existing = bpf_map_lookup_elem(&pending_handshakes_v6, &key);
@@ -1352,24 +1012,6 @@ int tc_ingress_syn_monitor(struct __sk_buff *skb) {
             
             struct handshake_status *existing = bpf_map_lookup_elem(&pending_handshakes_v6, &key);
             if (existing && existing->synack_sent) {
-                 if (existing->synack_time > 0) {
-                     __u64 now = bpf_ktime_get_ns();
-                     if (now > existing->synack_time) {
-                         __u64 rtt_ns = now - existing->synack_time;
-                         struct event_metadata meta = {};
-                         __builtin_memcpy(meta.saddr_v6, &ip6->saddr, 16);
-                         meta.is_v6 = 1; 
-                         meta.saddr_v4 = 0;
-                         meta.sport = tcp->source;
-                         meta.dport = tcp->dest;
-                         meta.protocol = IPPROTO_TCP;
-                         meta.type = 2; // JA4L / RTT
-                         meta.rtt_us = (__u32)(rtt_ns / 1000);
-                         meta.ttl = ip6->hop_limit;
-                         
-                         bpf_perf_event_output(skb, &events, BPF_F_CURRENT_CPU, &meta, sizeof(meta));
-                     }
-                }
                 __u64 now = bpf_ktime_get_ns();
                 bpf_map_delete_elem(&pending_handshakes_v6, &key);
                 decrement_incomplete_handshake_count_v6(&key.saddr, now);
@@ -1388,8 +1030,6 @@ int tc_egress_synack_monitor(struct __sk_buff *skb) {
 
     struct ethhdr *eth = data;
     if ((void *)(eth + 1) > data_end) return TC_ACT_OK;
-
-    __u64 pkt_len = skb->len;
 
     if (eth->h_proto == bpf_htons(ETH_P_IP)) {
         struct iphdr *ip = (void *)(eth + 1);
