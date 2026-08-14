@@ -35,8 +35,6 @@ type Config struct {
 	HAProxyPort                  int
 	SocketPath                   string
 	GeoIPASNPath                 string
-	AllowlistCIDRs               string
-	PolicyRules                  string
 	DynamicAllowlistSocketPath   string
 	DynamicAllowlistInterval     time.Duration
 	HAProxyWhitelistMapPath      string
@@ -77,7 +75,6 @@ type Collector struct {
 	allowedNets        []*net.IPNet
 	dynamicAllowedNets map[string]*net.IPNet
 	allowlistMu        sync.RWMutex
-	policyRules        []ebpf.PolicyRule
 	perfReader         *perf.Reader
 	incidentReader     *perf.Reader
 
@@ -179,20 +176,6 @@ func New(cfg Config, logger *logrus.Logger) (*Collector, error) {
 		}
 	}
 
-	if cfg.AllowlistCIDRs != "" {
-		c.allowedNets = parseAllowlist(cfg.AllowlistCIDRs, logger)
-		logger.WithField("count", len(c.allowedNets)).Info("Loaded allowlist CIDRs")
-	}
-
-	if cfg.PolicyRules != "" {
-		rules, err := parsePolicyRules(cfg.PolicyRules)
-		if err != nil {
-			logger.WithError(err).Warn("Failed to parse -policy rules; ignoring invalid entries")
-		}
-		c.policyRules = rules
-		logger.WithField("count", len(c.policyRules)).Info("Loaded policy engine rules")
-	}
-
 	return c, nil
 }
 
@@ -249,14 +232,6 @@ func (c *Collector) Start(ctx context.Context) error {
 	if len(c.allowedNets) > 0 {
 		if err := c.Maps.SyncAllowlist(c.allowedNets); err != nil {
 			c.Logger.WithError(err).Warn("Failed to fully populate kernel-space allowlist maps")
-		}
-	}
-
-	if len(c.policyRules) > 0 {
-		if err := c.Maps.SetPolicies(c.policyRules); err != nil {
-			c.Logger.WithError(err).Warn("Failed to fully populate kernel-space policy engine maps")
-		} else {
-			c.Logger.WithField("count", len(c.policyRules)).Info("Kernel-space policy engine rules active")
 		}
 	}
 
@@ -1608,85 +1583,6 @@ func (c *Collector) startCollectorMetricsServer() *http.Server {
 		IdleTimeout:       60 * time.Second,
 		MaxHeaderBytes:    1 << 16,
 	}
-}
-
-func parseAllowlist(cidrs string, logger *logrus.Logger) []*net.IPNet {
-	if cidrs == "" {
-		return nil
-	}
-
-	var nets []*net.IPNet
-	for _, cidr := range strings.Split(cidrs, ",") {
-		cidr = strings.TrimSpace(cidr)
-		if cidr == "" {
-			continue
-		}
-
-		if !strings.Contains(cidr, "/") {
-			if strings.Contains(cidr, ":") {
-				cidr = cidr + "/128"
-			} else {
-				cidr = cidr + "/32"
-			}
-		}
-
-		_, ipNet, err := net.ParseCIDR(cidr)
-		if err != nil {
-			logger.WithError(err).WithField("cidr", cidr).Warn("Invalid CIDR in allowlist")
-			continue
-		}
-		nets = append(nets, ipNet)
-		logger.WithField("cidr", cidr).Debug("Added to allowlist")
-	}
-
-	return nets
-}
-
-func parsePolicyRules(spec string) ([]ebpf.PolicyRule, error) {
-	if spec == "" {
-		return nil, nil
-	}
-
-	var rules []ebpf.PolicyRule
-	var errs []error
-	for _, entry := range strings.Split(spec, ",") {
-		entry = strings.TrimSpace(entry)
-		if entry == "" {
-			continue
-		}
-
-		idx := strings.LastIndex(entry, "=")
-		if idx < 0 {
-			errs = append(errs, fmt.Errorf("invalid policy entry %q (want CIDR=action)", entry))
-			continue
-		}
-		cidr := strings.TrimSpace(entry[:idx])
-		actionStr := strings.TrimSpace(entry[idx+1:])
-
-		if !strings.Contains(cidr, "/") {
-			if strings.Contains(cidr, ":") {
-				cidr = cidr + "/128"
-			} else {
-				cidr = cidr + "/32"
-			}
-		}
-
-		_, ipNet, err := net.ParseCIDR(cidr)
-		if err != nil {
-			errs = append(errs, fmt.Errorf("invalid CIDR %q in policy entry %q: %w", entry[:idx], entry, err))
-			continue
-		}
-
-		action, err := ebpf.ParsePolicyAction(actionStr)
-		if err != nil {
-			errs = append(errs, fmt.Errorf("invalid policy entry %q: %w", entry, err))
-			continue
-		}
-
-		rules = append(rules, ebpf.PolicyRule{Net: ipNet, Action: action})
-	}
-
-	return rules, joinErrors(errs)
 }
 
 func joinErrors(errs []error) error {

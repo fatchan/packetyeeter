@@ -74,7 +74,6 @@ type BadFlagsInfo struct {
 // #defines in protector.bpf.c.
 const (
 	IncidentBlockedIP   = 1
-	IncidentPolicyBlock = 2
 	IncidentICMPRate    = 3
 	IncidentUDPRate     = 4
 	IncidentUDPFrag     = 5
@@ -89,8 +88,6 @@ func IncidentReasonName(reason uint8) string {
 	switch reason {
 	case IncidentBlockedIP:
 		return "blocked_ip"
-	case IncidentPolicyBlock:
-		return "policy_block"
 	case IncidentICMPRate:
 		return "icmp_rate"
 	case IncidentUDPRate:

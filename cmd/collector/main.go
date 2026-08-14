@@ -24,8 +24,6 @@ func main() {
 		haproxyPort                  = flag.Int("haproxy-port", 0, "HAProxy peer protocol port")
 		socketPath                   = flag.String("socket", "/var/run/packetyeeter-collector.sock", "Unix socket for CLI")
 		geoIPASNPath                 = flag.String("geoip-asn", "", "Path to GeoLite2-ASN.mmdb")
-		allowlist                    = flag.String("allowlist", "", "Comma-separated CIDRs to allowlist (e.g., 10.0.0.0/8,192.168.1.0/24)")
-		policy                       = flag.String("policy", "", "Comma-separated per-CIDR policy overrides as CIDR=action (action = block|monitor), e.g. 203.0.113.0/24=block,198.51.100.0/24=monitor")
 		dynamicAllowlistSocketPath   = flag.String("dynamic-allowlist-socket-path", "", "Path to HAProxy runtime Unix socket for dynamic allowlist syncing; if empty, dynamic allowlist syncing is disabled")
 		dynamicAllowlistInterval     = flag.Duration("dynamic-allowlist-interval", 60*time.Second, "How often to refresh the dynamic allowlist")
 		haproxyWhitelistMapPath      = flag.String("haproxy-whitelist-map-path", "/etc/haproxy/maps/whitelist.map", "Path to the HAProxy whitelist map containing incoming IPs to always allow")
@@ -66,8 +64,6 @@ func main() {
 		HAProxyPort:                  *haproxyPort,
 		SocketPath:                   *socketPath,
 		GeoIPASNPath:                 *geoIPASNPath,
-		AllowlistCIDRs:               *allowlist,
-		PolicyRules:                  *policy,
 		DynamicAllowlistSocketPath:   *dynamicAllowlistSocketPath,
 		DynamicAllowlistInterval:     *dynamicAllowlistInterval,
 		HAProxyWhitelistMapPath:      *haproxyWhitelistMapPath,

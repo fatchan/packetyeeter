@@ -90,8 +90,6 @@ func (l *Loader) Load() error {
 		HTTP3SeenIPsV6:              l.coll.Maps["http3_seen_ips_v6"],
 		AllowListV4:                 l.coll.Maps["allowlist_v4"],
 		AllowListV6:                 l.coll.Maps["allowlist_v6"],
-		PolicyV4:                    l.coll.Maps["policy_v4"],
-		PolicyV6:                    l.coll.Maps["policy_v6"],
 		PolicyBlocks:                l.coll.Maps["policy_blocks"],
 		PolicyBlocksV6:              l.coll.Maps["policy_blocks_v6"],
 		Events:                      l.coll.Maps["events"],
