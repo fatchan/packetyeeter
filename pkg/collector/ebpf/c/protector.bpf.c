@@ -22,7 +22,7 @@
 #define BADFLAGS_MAP_SIZE 50000
 
 #define ALLOWLIST_MAP_SIZE 1024
-#define CONFIG_MAP_SIZE 5
+#define CONFIG_MAP_SIZE 4
 #define INCIDENT_DROP_COUNTS_SIZE 8
 #define BUDGET_MAP_SIZE 1
 
@@ -277,32 +277,6 @@ struct {
     __type(value, struct bad_flags_info);
 } bad_flags_v6 SEC(".maps");
 
-// Cumulative egress (server -> client) byte counters, keyed by the client
-// address. This is what makes sustained-download/enumeration detection
-// possible without HAProxy stick tables: HAProxy cannot report transferred
-// bytes over SPOE at all, because `bytes_out` is stream-scoped, is zeroed for
-// every new stream, and the on-http-response event fires before the response
-// body is transferred. Counting on the TC egress path instead measures real
-// wire bytes, so chunked and streamed responses are accounted correctly.
-//
-// Values are monotonic and never reset in kernel space; userspace diffs them
-// per poll. LRU so a high-cardinality client population evicts the coldest
-// entry rather than failing inserts once full - an evicted-then-reinserted
-// entry looks like a counter reset to userspace, which is handled there.
-struct {
-    __uint(type, BPF_MAP_TYPE_LRU_HASH);
-    __uint(max_entries, GENERAL_MAP_MAX_ENTRIES);
-    __type(key, __u32);
-    __type(value, __u64);
-} egress_bytes SEC(".maps");
-
-struct {
-    __uint(type, BPF_MAP_TYPE_LRU_HASH);
-    __uint(max_entries, GENERAL_MAP_MAX_ENTRIES);
-    __type(key, struct in6_addr);
-    __type(value, __u64);
-} egress_bytes_v6 SEC(".maps");
-
 // Exact drop counters by incident reason. This stays out of the perf-event
 // path so Prometheus can see exact totals even when incident events are
 // budgeted/sampled or userspace logging is throttled.
@@ -317,11 +291,10 @@ struct {
 //   0 = ICMP rate limit (pps)
 //   1 = monitor/dry-run mode (nonzero = never XDP_DROP)
 //   2 = UDP rate limit (pps)
-//   3 = egress accounting enable
-//   4 = UDP/IPv6 fragment mode (see CONFIG_KEY_UDP_FRAG_MODE)
+//   3 = UDP/IPv6 fragment mode (see CONFIG_KEY_UDP_FRAG_MODE)
 struct {
     __uint(type, BPF_MAP_TYPE_ARRAY);
-    __uint(max_entries, 5);
+    __uint(max_entries, 4);
     __type(key, __u32);
     __type(value, __u32);
 } config_map SEC(".maps");
@@ -594,27 +567,15 @@ static __always_inline int emit_allowed(void *budget_map, __u64 now) {
     return 1;
 }
 
-// CONFIG_KEY_EGRESS_ACCOUNTING is the config_map index userspace sets to enable
-// egress byte accounting. It defaults to 0 (disabled) so the accounting costs
-// nothing but a single array lookup per egress packet until an operator turns
-// it on. Indices 0, 1 and 2 are the ICMP limit, monitor mode and UDP limit.
-#define CONFIG_KEY_EGRESS_ACCOUNTING 3
-
 // CONFIG_KEY_UDP_FRAG_MODE controls fragmented UDP / IPv6 fragment handling.
 //   0 = rate (default): do not hard-drop solely for fragmentation; subject
 //       identifiable UDP fragments to the normal UDP rate limit. Needed on
 //       low-MTU / VPN paths where fragmentation is routine legitimate traffic.
 //   1 = drop: legacy unconditional drop of fragmented UDP (v4) and any IPv6
 //       Fragment extension header.
-#define CONFIG_KEY_UDP_FRAG_MODE 4
+#define CONFIG_KEY_UDP_FRAG_MODE 3
 #define UDP_FRAG_MODE_RATE 0
 #define UDP_FRAG_MODE_DROP 1
-
-static __always_inline int egress_accounting_enabled(void) {
-    __u32 key = CONFIG_KEY_EGRESS_ACCOUNTING;
-    __u32 *enabled = bpf_map_lookup_elem(&config_map, &key);
-    return enabled && *enabled;
-}
 
 static __always_inline __u32 udp_frag_mode(void) {
     __u32 key = CONFIG_KEY_UDP_FRAG_MODE;
@@ -632,40 +593,6 @@ struct ip6_frag_hdr {
     __be16 frag_off;
     __be32 identification;
 };
-
-// account_egress_v4/v6 add this packet's length to the client's cumulative
-// counter. The add is atomic because the same client can be transmitted to from
-// several CPUs concurrently, and a lost update here would silently understate a
-// download. On the first packet the entry does not exist yet, so it is created
-// with this packet's length; a racing creation is resolved by BPF_ANY
-// overwriting with an equal value, which loses at most one packet's bytes.
-static __always_inline void account_egress_v4(__u32 client, __u64 len) {
-    // Egress byte accounting intentionally neutered for now.
-    // Keep the helper and maps in place to avoid loader/plumbing churn, but do
-    // not touch egress_bytes so TC egress no longer updates per-client totals.
-    // __u64 *total = bpf_map_lookup_elem(&egress_bytes, &client);
-    // if (total) {
-    //     __sync_fetch_and_add(total, len);
-    //     return;
-    // }
-    // bpf_map_update_elem(&egress_bytes, &client, &len, BPF_ANY);
-    (void)client;
-    (void)len;
-}
-
-static __always_inline void account_egress_v6(struct in6_addr *client, __u64 len) {
-    // Egress byte accounting intentionally neutered for now.
-    // Keep the helper and maps in place to avoid loader/plumbing churn, but do
-    // not touch egress_bytes_v6 so TC egress no longer updates per-client totals.
-    // __u64 *total = bpf_map_lookup_elem(&egress_bytes_v6, client);
-    // if (total) {
-    //     __sync_fetch_and_add(total, len);
-    //     return;
-    // }
-    // bpf_map_update_elem(&egress_bytes_v6, client, &len, BPF_ANY);
-    (void)client;
-    (void)len;
-}
 
 // emit_incident_v4/v6 record a structured incident (source, reason,
 // timestamp) onto the `incidents` perf event array for XDP_DROP decisions made
@@ -995,7 +922,6 @@ int xdp_filter(struct xdp_md *ctx) {
         __u32 saddr = ip->saddr;
         __u64 *val = bpf_map_lookup_elem(&blocked_ips, &saddr);
         if (val) {
-            __sync_fetch_and_add(val, 1);
             emit_incident_v4(ctx, saddr, INCIDENT_BLOCKED_IP, now);
             if (!is_monitor) {
                 count_incident_drop(INCIDENT_BLOCKED_IP);
@@ -1096,7 +1022,6 @@ int xdp_filter(struct xdp_md *ctx) {
 
         __u64 *val = bpf_map_lookup_elem(&blocked_ips_v6, &saddr);
         if (val) {
-            __sync_fetch_and_add(val, 1);
             emit_incident_v6(ctx, &saddr, INCIDENT_BLOCKED_IP, now);
             if (!is_monitor) {
                 count_incident_drop(INCIDENT_BLOCKED_IP);
@@ -1464,11 +1389,6 @@ int tc_egress_synack_monitor(struct __sk_buff *skb) {
     struct ethhdr *eth = data;
     if ((void *)(eth + 1) > data_end) return TC_ACT_OK;
 
-    // Looked up once per packet rather than once per address family so the
-    // config_map lookup is not duplicated on both branches.
-    // Egress accounting is currently neutered in account_egress_v4/v6, so this
-    // flag no longer has any practical effect beyond preserving the old control flow.
-    int account = egress_accounting_enabled();
     __u64 pkt_len = skb->len;
 
     if (eth->h_proto == bpf_htons(ETH_P_IP)) {
@@ -1476,12 +1396,6 @@ int tc_egress_synack_monitor(struct __sk_buff *skb) {
         if ((void *)(ip + 1) > data_end) return TC_ACT_OK;
 
         if (ip->protocol != IPPROTO_TCP) return TC_ACT_OK;
-
-        // Account before parsing the TCP header: a packet whose header is not
-        // in the linear data still carries payload bytes to the client, and
-        // dropping it from the count would understate exactly the large
-        // segmented transfers this counter exists to measure.
-        if (account) account_egress_v4(ip->daddr, pkt_len);
 
         struct tcphdr *tcp = ipv4_tcp_header(ip, data_end);
         if (!tcp) return TC_ACT_OK;
@@ -1503,8 +1417,6 @@ int tc_egress_synack_monitor(struct __sk_buff *skb) {
         struct ipv6hdr *ip6 = (void *)(eth + 1);
         if ((void *)(ip6 + 1) > data_end) return TC_ACT_OK;
         if (ip6->nexthdr != IPPROTO_TCP) return TC_ACT_OK; 
-
-        if (account) account_egress_v6(&ip6->daddr, pkt_len);
 
         struct tcphdr *tcp = (void *)(ip6 + 1);
         if ((void *)(tcp + 1) > data_end) return TC_ACT_OK;

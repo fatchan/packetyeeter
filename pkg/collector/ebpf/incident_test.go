@@ -11,7 +11,6 @@ func TestIncidentReasonName(t *testing.T) {
 		want   string
 	}{
 		{IncidentBlockedIP, "blocked_ip"},
-		{IncidentPolicyBlock, "policy_block"},
 		{IncidentICMPRate, "icmp_rate"},
 		{IncidentUDPRate, "udp_rate"},
 		{IncidentUDPFrag, "udp_frag"},

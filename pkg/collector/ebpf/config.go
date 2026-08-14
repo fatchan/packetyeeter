@@ -26,15 +26,9 @@ const (
 	configKeyUDPThreshold uint32 = 2
 )
 
-// configKeyEgressAccounting is the config_map array index checked by the TC
-// egress program (as CONFIG_KEY_EGRESS_ACCOUNTING in protector.bpf.c) before
-// adding a packet's length to the per-client egress byte counter. It defaults
-// to 0 so the accounting is inert until an operator enables it.
-const configKeyEgressAccounting uint32 = 3
-
 // configKeyUDPFragMode is the config_map array index for fragmented UDP /
 // IPv6 fragment handling (CONFIG_KEY_UDP_FRAG_MODE in protector.bpf.c).
-const configKeyUDPFragMode uint32 = 4
+const configKeyUDPFragMode uint32 = 3
 
 // UDP fragment policy modes written to config_map[configKeyUDPFragMode].
 const (
@@ -56,26 +50,6 @@ func ParseUDPFragMode(s string) (uint32, error) {
 	default:
 		return 0, fmt.Errorf("invalid udp-frag-mode %q (want rate|drop)", s)
 	}
-}
-
-// SetEgressAccounting toggles per-client egress byte accounting in the TC
-// egress program. When disabled the program still performs one array lookup
-// per egress packet but touches neither egress byte map, so the per-client
-// LRU maps stay empty and cost nothing.
-//
-// It is a safe no-op (not an error) when ConfigMap is nil, e.g. on unsupported
-// platforms or before the collector has finished loading eBPF.
-func (m *Maps) SetEgressAccounting(enabled bool) error {
-	if m.ConfigMap == nil {
-		return nil
-	}
-
-	var value uint32
-	if enabled {
-		value = 1
-	}
-
-	return m.ConfigMap.Put(configKeyEgressAccounting, value)
 }
 
 // SetUDPFragMode configures fragmented UDP / IPv6 fragment handling.
