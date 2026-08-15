@@ -4,10 +4,12 @@ import (
 	"bytes"
 	"context"
 	"encoding/binary"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net"
 	"net/http"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -45,6 +47,7 @@ type Config struct {
 	UDPThreshold                 uint32
 	IncompleteHandshakeThreshold uint32
 	HTTP3SeenTTL                 time.Duration
+	TargetedDomainsTTL           time.Duration
 	VerboseMapEntryUpdates       bool
 	DryRun                       bool
 	UDPFragMode                  uint32
@@ -64,6 +67,11 @@ type incidentLogThrottleState struct {
 	suppressed uint64
 }
 
+type CollectorJSONStatsResponse struct {
+	TargetedDomains []string `json:"targeted_domains"`
+	BlockedIPsTotal int      `json:"blocked_ips_total"`
+}
+
 type Collector struct {
 	Config Config
 
@@ -74,7 +82,9 @@ type Collector struct {
 	Logger             *logrus.Logger
 	allowedNets        []*net.IPNet
 	dynamicAllowedNets map[string]*net.IPNet
+	targetedDomains    map[string]time.Time
 	allowlistMu        sync.RWMutex
+	targetedDomainsMu  sync.RWMutex
 	incidentReader     *perf.Reader
 
 	// Previous rates to compute pps across windows (monotonic timestamps)
@@ -158,6 +168,7 @@ func New(cfg Config, logger *logrus.Logger) (*Collector, error) {
 		prevBadFlagsSeen:       make(map[uint32]uint64),
 		prevBadFlagsSeenV6:     make(map[[16]byte]uint64),
 		dynamicAllowedNets:     make(map[string]*net.IPNet),
+		targetedDomains:        make(map[string]time.Time),
 		incidentLogState:       make(map[string]*incidentLogThrottleState),
 	}
 
@@ -240,7 +251,7 @@ func (c *Collector) Start(ctx context.Context) error {
 	}
 
 	if c.Config.HAProxyPort > 0 {
-		c.haproxyPeerServer = haproxy.NewServer(c.Config.HAProxyPort, c.Maps, c.Config.HTTP3SeenTTL, c.Config.VerboseMapEntryUpdates)
+		c.haproxyPeerServer = haproxy.NewServer(c.Config.HAProxyPort, c.Maps, c, c.Config.HTTP3SeenTTL, c.Config.TargetedDomainsTTL, c.Config.VerboseMapEntryUpdates)
 		c.wg.Add(1)
 		go func() {
 			defer c.wg.Done()
@@ -288,6 +299,48 @@ func (c *Collector) Start(ctx context.Context) error {
 
 	c.Logger.Info("Collector started")
 	return nil
+}
+
+func (c *Collector) MarkTargetedDomain(entry string, ttl time.Duration) {
+	entry = strings.TrimSpace(strings.ToLower(entry))
+	if entry == "" {
+		return
+	}
+	if ttl <= 0 {
+		ttl = c.Config.TargetedDomainsTTL
+		if ttl <= 0 {
+			ttl = 10 * time.Minute
+		}
+	}
+	c.targetedDomainsMu.Lock()
+	c.targetedDomains[entry] = time.Now().Add(ttl)
+	c.targetedDomainsMu.Unlock()
+}
+
+func (c *Collector) pruneTargetedDomains(now time.Time) int {
+	c.targetedDomainsMu.Lock()
+	defer c.targetedDomainsMu.Unlock()
+	removed := 0
+	for entry, expiresAt := range c.targetedDomains {
+		if !expiresAt.After(now) {
+			delete(c.targetedDomains, entry)
+			removed++
+		}
+	}
+	return removed
+}
+
+func (c *Collector) snapshotTargetedDomains(now time.Time) []string {
+	c.targetedDomainsMu.RLock()
+	entries := make([]string, 0, len(c.targetedDomains))
+	for entry, expiresAt := range c.targetedDomains {
+		if expiresAt.After(now) {
+			entries = append(entries, entry)
+		}
+	}
+	c.targetedDomainsMu.RUnlock()
+	sort.Strings(entries)
+	return entries
 }
 
 func (c *Collector) checkAllowlist(ip net.IP) bool {
@@ -386,6 +439,7 @@ func (c *Collector) pollMaps() {
 
 			if lastBlockedIPsCountSync.IsZero() || time.Since(lastBlockedIPsCountSync) >= blockedIPCountSyncInterval {
 				c.syncBlockedIPCounts()
+				c.pruneTargetedDomains(time.Now())
 				lastBlockedIPsCountSync = time.Now()
 			}
 
@@ -1103,6 +1157,7 @@ func (c *Collector) cleanupStaleKernelState() {
 	start := time.Now()
 	removedICMPv4, removedICMPv6 := 0, 0
 	removedUDPv4, removedUDPv6 := 0, 0
+	removedHTTP3SeenV4, removedHTTP3SeenV6 := 0, 0
 	removedBadFlagsV4, removedBadFlagsV6 := 0, 0
 	removedHandshakesV4, removedHandshakesV6 := 0, 0
 	removedHandshakeCountsV4, removedHandshakeCountsV6 := 0, 0
@@ -1112,11 +1167,13 @@ func (c *Collector) cleanupStaleKernelState() {
 		duration := time.Since(start)
 		metrics.KernelStateCleanupDurationMilliseconds.Set(float64(duration.Milliseconds()))
 		fields := logrus.Fields{
-			"removed_total":                  removedICMPv4 + removedICMPv6 + removedUDPv4 + removedUDPv6 + removedBadFlagsV4 + removedBadFlagsV6 + removedHandshakesV4 + removedHandshakesV6 + removedHandshakeCountsV4 + removedHandshakeCountsV6,
+			"removed_total":                  removedICMPv4 + removedICMPv6 + removedUDPv4 + removedUDPv6 + removedHTTP3SeenV4 + removedHTTP3SeenV6 + removedBadFlagsV4 + removedBadFlagsV6 + removedHandshakesV4 + removedHandshakesV6 + removedHandshakeCountsV4 + removedHandshakeCountsV6,
 			"icmp_v4":                        removedICMPv4,
 			"icmp_v6":                        removedICMPv6,
 			"udp_v4":                         removedUDPv4,
 			"udp_v6":                         removedUDPv6,
+			"http3_seen_v4":                  removedHTTP3SeenV4,
+			"http3_seen_v6":                  removedHTTP3SeenV6,
 			"bad_flags_v4":                   removedBadFlagsV4,
 			"bad_flags_v6":                   removedBadFlagsV6,
 			"pending_handshakes_v4":          removedHandshakesV4,
@@ -1124,6 +1181,7 @@ func (c *Collector) cleanupStaleKernelState() {
 			"incomplete_handshake_counts_v4": removedHandshakeCountsV4,
 			"incomplete_handshake_counts_v6": removedHandshakeCountsV6,
 			"rate_expiry":                    kernelStateExpiryRate,
+			"http3_seen_ttl":                 c.Config.HTTP3SeenTTL,
 			"bad_flags_expiry":               kernelStateExpiryBadFlags,
 			"handshake_expiry":               kernelStateExpiryHandshake,
 			"run_interval":                   kernelStateCleanupInterval,
@@ -1154,6 +1212,8 @@ func (c *Collector) cleanupStaleKernelState() {
 	removedICMPv6 = pruneKernelRateMapV6(c.Maps.ICMPRatesV6, staleKernelCutoff(nowNS, kernelStateExpiryRate), c.Logger, "icmp_rates_v6")
 	removedUDPv4 = pruneKernelRateMap(c.Maps.UDPRates, staleKernelCutoff(nowNS, kernelStateExpiryRate), c.Logger, "udp_rates")
 	removedUDPv6 = pruneKernelRateMapV6(c.Maps.UDPRatesV6, staleKernelCutoff(nowNS, kernelStateExpiryRate), c.Logger, "udp_rates_v6")
+	removedHTTP3SeenV4 = pruneKernelExpiryMap(c.Maps.HTTP3SeenIPs, nowNS, c.Logger, "http3_seen_ips")
+	removedHTTP3SeenV6 = pruneKernelExpiryMapV6(c.Maps.HTTP3SeenIPsV6, nowNS, c.Logger, "http3_seen_ips_v6")
 	removedBadFlagsV4 = pruneKernelBadFlagsMap(c.Maps.BadFlags, staleKernelCutoff(nowNS, kernelStateExpiryBadFlags), c.Logger, "bad_flags")
 	removedBadFlagsV6 = pruneKernelBadFlagsMapV6(c.Maps.BadFlagsV6, staleKernelCutoff(nowNS, kernelStateExpiryBadFlags), c.Logger, "bad_flags_v6")
 	removedHandshakesV4 = pruneKernelPendingHandshakesMap(c.Maps.PendingHandshakes, handshakeCutoff, c.Logger, "pending_handshakes")
@@ -1219,6 +1279,60 @@ func pruneKernelRateMapV6(m *cebpf.Map, cutoffNS uint64, logger *logrus.Logger, 
 			removed++
 		} else if logger != nil {
 			logger.WithError(err).WithField("map", mapName).Debug("Failed to delete stale kernel rate v6 entry")
+		}
+	}
+	return removed
+}
+
+func pruneKernelExpiryMap(m *cebpf.Map, nowNS uint64, logger *logrus.Logger, mapName string) int {
+	if m == nil || nowNS == 0 {
+		return 0
+	}
+	var key uint32
+	var expiresAt uint64
+	iter := m.Iterate()
+	keysToDelete := make([]uint32, 0)
+	for iter.Next(&key, &expiresAt) {
+		if expiresAt == 0 || expiresAt <= nowNS {
+			keysToDelete = append(keysToDelete, key)
+		}
+	}
+	if err := iter.Err(); err != nil && logger != nil {
+		logger.WithError(err).WithField("map", mapName).Warn("Failed to iterate kernel expiry map for stale cleanup")
+	}
+	removed := 0
+	for _, k := range keysToDelete {
+		if err := m.Delete(&k); err == nil {
+			removed++
+		} else if logger != nil {
+			logger.WithError(err).WithField("map", mapName).Debug("Failed to delete stale kernel expiry entry")
+		}
+	}
+	return removed
+}
+
+func pruneKernelExpiryMapV6(m *cebpf.Map, nowNS uint64, logger *logrus.Logger, mapName string) int {
+	if m == nil || nowNS == 0 {
+		return 0
+	}
+	var key [16]byte
+	var expiresAt uint64
+	iter := m.Iterate()
+	keysToDelete := make([][16]byte, 0)
+	for iter.Next(&key, &expiresAt) {
+		if expiresAt == 0 || expiresAt <= nowNS {
+			keysToDelete = append(keysToDelete, key)
+		}
+	}
+	if err := iter.Err(); err != nil && logger != nil {
+		logger.WithError(err).WithField("map", mapName).Warn("Failed to iterate kernel expiry v6 map for stale cleanup")
+	}
+	removed := 0
+	for _, k := range keysToDelete {
+		if err := m.Delete(&k); err == nil {
+			removed++
+		} else if logger != nil {
+			logger.WithError(err).WithField("map", mapName).Debug("Failed to delete stale kernel expiry v6 entry")
 		}
 	}
 	return removed
@@ -1429,6 +1543,40 @@ func (c *Collector) gcExpiredBlocks() {
 	}
 }
 
+func (c *Collector) buildJSONStatsResponse() CollectorJSONStatsResponse {
+	blockedTotal := 0
+	if c.Maps != nil {
+		if ipv4Count, err := countMapEntriesUint32(c.Maps.BlockedIPs); err == nil {
+			blockedTotal += ipv4Count
+		} else {
+			c.Logger.WithError(err).Debug("Failed counting IPv4 blocked IPs for JSON stats")
+		}
+		if ipv6Count, err := countMapEntriesIPv6(c.Maps.BlockedIPsV6); err == nil {
+			blockedTotal += ipv6Count
+		} else {
+			c.Logger.WithError(err).Debug("Failed counting IPv6 blocked IPs for JSON stats")
+		}
+	}
+
+	return CollectorJSONStatsResponse{
+		TargetedDomains: c.snapshotTargetedDomains(time.Now()),
+		BlockedIPsTotal: blockedTotal,
+	}
+}
+
+func (c *Collector) handleJSONStats(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	if err := json.NewEncoder(w).Encode(c.buildJSONStatsResponse()); err != nil {
+		http.Error(w, "failed to encode json", http.StatusInternalServerError)
+		return
+	}
+}
+
 func (c *Collector) startCollectorMetricsServer() *http.Server {
 	registry := prometheus.NewRegistry()
 
@@ -1453,6 +1601,7 @@ func (c *Collector) startCollectorMetricsServer() *http.Server {
 
 	mux := http.NewServeMux()
 	mux.Handle("/metrics", promhttp.HandlerFor(registry, promhttp.HandlerOpts{}))
+	mux.HandleFunc("/stats", c.handleJSONStats)
 
 	return &http.Server{
 		Addr:              c.Config.MetricsAddr,

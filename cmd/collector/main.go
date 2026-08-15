@@ -34,6 +34,7 @@ func main() {
 		udpThreshold                 = flag.Uint("udp-threshold", 0, "Kernel/XDP UDP per-source PPS threshold (0 = use built-in BPF default)")
 		incompleteHandshakeThreshold = flag.Uint("incomplete-handshake-threshold", 0, "Collector-side recent incomplete-handshake count required to auto-block a source IP (0 = disabled)")
 		http3SeenTTL                 = flag.Duration("http3-seen-ttl", 10*time.Minute, "How long a peer-fed HTTP/3-seen IP should be exempt from UDP rate limiting")
+		targetedDomainsTTL           = flag.Duration("targeted-domains-ttl", 10*time.Minute, "How long targeted domains remain in the map for notification/stats")
 		verboseMapEntryUpdates       = flag.Bool("verbose-map-entry-updates", true, "Enable verbose logging for HAProxy peer stick-table/map entry updates")
 		dryRun                       = flag.Bool("dry-run", false, "Monitor mode: log/count the collector's own kernel-space detections (bad flags, SYN flood, ICMP/UDP rate limits) without dropping traffic")
 		udpFragMode                  = flag.String("udp-frag-mode", "drop", "Fragmented UDP / IPv6 fragment policy: rate (default, rate-limit only) or drop (legacy hard-drop)")
@@ -74,6 +75,7 @@ func main() {
 		UDPThreshold:                 uint32(*udpThreshold),
 		IncompleteHandshakeThreshold: uint32(*incompleteHandshakeThreshold),
 		HTTP3SeenTTL:                 *http3SeenTTL,
+		TargetedDomainsTTL:           *targetedDomainsTTL,
 		VerboseMapEntryUpdates:       *verboseMapEntryUpdates,
 		DryRun:                       *dryRun,
 		UDPFragMode:                  fragMode,

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"strings"
 	"sync"
 	"time"
 
@@ -17,9 +18,11 @@ import (
 )
 
 const (
-	blockFeedTableName  = "packetyeeter_block_feed"
-	http3SeenTableName  = "packetyeeter_http3_seen"
-	defaultHTTP3SeenTTL = 10 * time.Minute
+	blockFeedTableName        = "packetyeeter_block_feed"
+	http3SeenTableName        = "packetyeeter_http3_seen"
+	targetedDomainsTableName  = "packetyeeter_targeted_domains"
+	defaultHTTP3SeenTTL       = 10 * time.Minute
+	defaultTargetedDomainsTTL = 10 * time.Minute
 )
 
 // Blocker is the subset of *ebpf.Maps this package depends on. It exists so
@@ -30,10 +33,16 @@ type Blocker interface {
 	MarkHTTP3SeenIP(ip net.IP, ttl time.Duration) error
 }
 
+type TargetedDomainTracker interface {
+	MarkTargetedDomain(entry string, ttl time.Duration)
+}
+
 type Server struct {
 	port                   int
 	blocker                Blocker
+	targetedDomainTracker  TargetedDomainTracker
 	http3SeenTTL           time.Duration
+	targetedDomainsTTL     time.Duration
 	verboseMapEntryUpdates bool
 
 	mu       sync.Mutex
@@ -41,14 +50,19 @@ type Server struct {
 	stopOnce sync.Once
 }
 
-func NewServer(port int, blocker Blocker, http3SeenTTL time.Duration, verboseMapEntryUpdates bool) *Server {
+func NewServer(port int, blocker Blocker, targetedDomainTracker TargetedDomainTracker, http3SeenTTL time.Duration, targetedDomainsTTL time.Duration, verboseMapEntryUpdates bool) *Server {
 	if http3SeenTTL <= 0 {
 		http3SeenTTL = defaultHTTP3SeenTTL
+	}
+	if targetedDomainsTTL <= 0 {
+		targetedDomainsTTL = defaultTargetedDomainsTTL
 	}
 	return &Server{
 		port:                   port,
 		blocker:                blocker,
+		targetedDomainTracker:  targetedDomainTracker,
 		http3SeenTTL:           http3SeenTTL,
+		targetedDomainsTTL:     targetedDomainsTTL,
 		verboseMapEntryUpdates: verboseMapEntryUpdates,
 	}
 }
@@ -77,7 +91,9 @@ func (s *Server) Start() error {
 		HandlerSource: func() peers.Handler {
 			return &handler{
 				blocker:                s.blocker,
+				targetedDomainTracker:  s.targetedDomainTracker,
 				http3SeenTTL:           s.http3SeenTTL,
+				targetedDomainsTTL:     s.targetedDomainsTTL,
 				verboseMapEntryUpdates: s.verboseMapEntryUpdates,
 			}
 		},
@@ -108,7 +124,9 @@ func (s *Server) Stop() error {
 
 type handler struct {
 	blocker                Blocker
+	targetedDomainTracker  TargetedDomainTracker
 	http3SeenTTL           time.Duration
+	targetedDomainsTTL     time.Duration
 	verboseMapEntryUpdates bool
 }
 
@@ -126,18 +144,21 @@ func (h *handler) HandleUpdate(ctx context.Context, update *sticktable.EntryUpda
 		tableName = update.StickTable.Name
 	}
 
-	ipStr := update.Key.String()
-	ip := net.ParseIP(ipStr)
-	if ip == nil {
-		logrus.WithFields(logrus.Fields{
-			"table": tableName,
-			"key":   ipStr,
-		}).Warn("Ignoring HAProxy peer update with non-IP key")
+	keyStr := strings.TrimSpace(update.Key.String())
+	if keyStr == "" {
 		return
 	}
 
 	switch tableName {
 	case blockFeedTableName:
+		ip := net.ParseIP(keyStr)
+		if ip == nil {
+			logrus.WithFields(logrus.Fields{
+				"table": tableName,
+				"key":   keyStr,
+			}).Warn("Ignoring HAProxy peer update with non-IP key")
+			return
+		}
 		if err := h.blocker.BlockIP(ip, "HAProxy Peer Update", logrus.Fields{
 			"source":      "haproxy",
 			"stick_table": tableName,
@@ -154,6 +175,14 @@ func (h *handler) HandleUpdate(ctx context.Context, update *sticktable.EntryUpda
 			"stick_table": tableName,
 		}).Info("Blocked IP from HAProxy peer table update")
 	case http3SeenTableName:
+		ip := net.ParseIP(keyStr)
+		if ip == nil {
+			logrus.WithFields(logrus.Fields{
+				"table": tableName,
+				"key":   keyStr,
+			}).Warn("Ignoring HAProxy peer update with non-IP key")
+			return
+		}
 		if err := h.blocker.MarkHTTP3SeenIP(ip, h.http3SeenTTL); err != nil {
 			logrus.WithError(err).WithFields(logrus.Fields{
 				"ip":          ip.String(),
@@ -168,10 +197,22 @@ func (h *handler) HandleUpdate(ctx context.Context, update *sticktable.EntryUpda
 				"ttl":         h.http3SeenTTL,
 			}).Info("Marked HTTP/3-seen IP from HAProxy peer table update")
 		}
+	case targetedDomainsTableName:
+		if h.targetedDomainTracker == nil {
+			return
+		}
+		h.targetedDomainTracker.MarkTargetedDomain(keyStr, h.targetedDomainsTTL)
+		if h.verboseMapEntryUpdates {
+			logrus.WithFields(logrus.Fields{
+				"entry":       keyStr,
+				"stick_table": tableName,
+				"ttl":         h.targetedDomainsTTL,
+			}).Info("Marked targeted domain from HAProxy peer table update")
+		}
 	default:
 		if h.verboseMapEntryUpdates {
 			logrus.WithFields(logrus.Fields{
-				"ip":          ip.String(),
+				"key":         keyStr,
 				"stick_table": tableName,
 			}).Debug("Ignoring HAProxy peer update for unrecognized stick-table")
 		}
