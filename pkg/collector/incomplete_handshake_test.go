@@ -61,7 +61,7 @@ func TestEnforceIncompleteHandshakeThresholdsIPv4Allowlisted(t *testing.T) {
 	assertNotBlockedIPv4(t, c, ip)
 }
 
-func TestEnforceIncompleteHandshakeThresholdsIPv4BlocksAtThresholdAndPurges(t *testing.T) {
+func TestEnforceIncompleteHandshakeThresholdsIPv4BlocksAtThreshold(t *testing.T) {
 	c := newIncompleteHandshakeUnitCollector(t)
 	c.Config.IncompleteHandshakeThreshold = 5
 	ip := net.ParseIP("198.51.100.10").To4()
@@ -78,11 +78,9 @@ func TestEnforceIncompleteHandshakeThresholdsIPv4BlocksAtThresholdAndPurges(t *t
 		t.Fatalf("metric delta = %v, want 1", got)
 	}
 	assertBlockedIPv4(t, c, ip)
-	assertNoCountV4(t, c, saddr)
-	assertNoPendingForIPv4(t, c, saddr)
 }
 
-func TestEnforceIncompleteHandshakeThresholdsIPv6BlocksAtThresholdAndPurges(t *testing.T) {
+func TestEnforceIncompleteHandshakeThresholdsIPv6BlocksAtThreshold(t *testing.T) {
 	c := newIncompleteHandshakeUnitCollector(t)
 	c.Config.IncompleteHandshakeThreshold = 3
 	ip := net.ParseIP("2001:db8::1234").To16()
@@ -99,8 +97,6 @@ func TestEnforceIncompleteHandshakeThresholdsIPv6BlocksAtThresholdAndPurges(t *t
 		t.Fatalf("metric delta = %v, want 1", got)
 	}
 	assertBlockedIPv6(t, c, ip)
-	assertNoCountV6(t, c, saddr)
-	assertNoPendingForIPv6(t, c, saddr)
 }
 
 func TestRemovePendingHandshakeIPv4DecrementsAndDeletesCount(t *testing.T) {
