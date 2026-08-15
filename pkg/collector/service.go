@@ -365,6 +365,7 @@ func (c *Collector) pollMaps() {
 	c.Logger.WithField("interval", interval).Info("Starting eBPF map poller")
 
 	lastKernelStateGC := time.Time{}
+	lastBlockedIPsCountSync := time.Time{}
 
 	for {
 		select {
@@ -382,7 +383,12 @@ func (c *Collector) pollMaps() {
 
 			// no need to prune prev rates if we dont refresh them
 			// c.prunePreviousRates()
-			
+
+			if lastBlockedIPsCountSync.IsZero() || time.Since(lastBlockedIPsCountSync) >= blockedIPCountSyncInterval {
+				c.syncBlockedIPCounts()
+				lastBlockedIPsCountSync = time.Now()
+			}
+
 			if lastKernelStateGC.IsZero() || time.Since(lastKernelStateGC) >= kernelStateCleanupInterval {
 				c.cleanupStaleKernelState()
 				lastKernelStateGC = time.Now()
@@ -520,6 +526,65 @@ func (c *Collector) syncIncidentDropCounters() {
 		}
 		c.prevIncidentDropCounts[reason] = total
 	}
+}
+
+func (c *Collector) syncBlockedIPCounts() {
+	if c.Maps == nil {
+		metrics.BlockedIPsCurrent.WithLabelValues("ipv4").Set(0)
+		metrics.BlockedIPsCurrent.WithLabelValues("ipv6").Set(0)
+		metrics.BlockedIPsCurrentTotal.Set(0)
+		return
+	}
+
+	ipv4Count, err := countMapEntriesUint32(c.Maps.BlockedIPs)
+	if err != nil {
+		c.Logger.WithError(err).Debug("Failed counting IPv4 blocked IP entries")
+	} else {
+		metrics.BlockedIPsCurrent.WithLabelValues("ipv4").Set(float64(ipv4Count))
+	}
+
+	ipv6Count, err := countMapEntriesIPv6(c.Maps.BlockedIPsV6)
+	if err != nil {
+		c.Logger.WithError(err).Debug("Failed counting IPv6 blocked IP entries")
+	} else {
+		metrics.BlockedIPsCurrent.WithLabelValues("ipv6").Set(float64(ipv6Count))
+	}
+
+	metrics.BlockedIPsCurrentTotal.Set(float64(ipv4Count + ipv6Count))
+}
+
+func countMapEntriesUint32(m *cebpf.Map) (int, error) {
+	if m == nil {
+		return 0, nil
+	}
+	var key uint32
+	var value uint64
+	count := 0
+	iter := m.Iterate()
+	for iter.Next(&key, &value) {
+		count++
+	}
+	if err := iter.Err(); err != nil {
+		return 0, err
+	}
+	return count, nil
+}
+
+func countMapEntriesIPv6(m *cebpf.Map) (int, error) {
+	if m == nil {
+		return 0, nil
+	}
+	var key [16]byte
+	var value uint64
+	count := 0
+	iter := m.Iterate()
+	for iter.Next(&key, &value) {
+		count++
+	}
+	if err := iter.Err(); err != nil {
+		return 0, err
+	}
+	return count, nil
 }
 
 func readPerCPUCounter(m *cebpf.Map, key uint32) (uint64, error) {
@@ -933,6 +998,7 @@ const (
 	kernelStateExpiryBadFlags  time.Duration = 10 * time.Minute
 	kernelStateExpiryHandshake time.Duration = 30 * time.Second
 	kernelStateCleanupInterval               = 5 * time.Minute
+	blockedIPCountSyncInterval               = 30 * time.Second
 )
 
 func (c *Collector) prunePreviousRates() {
@@ -1371,6 +1437,8 @@ func (c *Collector) startCollectorMetricsServer() *http.Server {
 	registry.MustRegister(metrics.KernelStateCleanupDurationMilliseconds)
 	registry.MustRegister(metrics.PerfLostSamples)
 	registry.MustRegister(metrics.IncompleteHandshakeBlocks)
+	registry.MustRegister(metrics.BlockedIPsCurrent)
+	registry.MustRegister(metrics.BlockedIPsCurrentTotal)
 
 	for reason := uint32(1); reason < uint32(ebpf.IncidentMax); reason++ {
 		name := ebpf.IncidentReasonName(uint8(reason))
@@ -1379,6 +1447,9 @@ func (c *Collector) startCollectorMetricsServer() *http.Server {
 	}
 
 	metrics.PerfLostSamples.WithLabelValues("incidents").Add(0)
+	metrics.BlockedIPsCurrent.WithLabelValues("ipv4").Set(0)
+	metrics.BlockedIPsCurrent.WithLabelValues("ipv6").Set(0)
+	metrics.BlockedIPsCurrentTotal.Set(0)
 
 	mux := http.NewServeMux()
 	mux.Handle("/metrics", promhttp.HandlerFor(registry, promhttp.HandlerOpts{}))

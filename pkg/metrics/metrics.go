@@ -108,6 +108,16 @@ var (
 		Help: "Total ICMP packet rate (pps) across offenders",
 	})
 
+	BlockedIPsCurrent = promauto.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "packetyeeter_blocked_ips_current",
+		Help: "Current number of blocked IP entries in kernel maps by IP family",
+	}, []string{"family"})
+
+	BlockedIPsCurrentTotal = promauto.NewGauge(prometheus.GaugeOpts{
+		Name: "packetyeeter_blocked_ips_current_total",
+		Help: "Current total number of blocked IP entries across IPv4 and IPv6 kernel maps",
+	})
+
 	JA4TSuspiciousEvents = promauto.NewCounter(prometheus.CounterOpts{
 		Name: "packetyeeter_ja4t_suspicious_total",
 		Help: "Total number of suspicious activity events detected via JA4T fingerprinting",
