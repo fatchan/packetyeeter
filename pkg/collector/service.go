@@ -647,9 +647,6 @@ func (c *Collector) enforceIncompleteHandshakeThresholdsIPv4(nowNS uint64) {
 			}).Warn("Failed to block IP for incomplete handshake flood")
 			continue
 		}
-		if err := c.purgePendingHandshakesForIPv4(ip); err != nil {
-			c.Logger.WithError(err).WithField("ip", ip.String()).Warn("Blocked IP but failed to purge IPv4 pending handshake state")
-		}
 	}
 	if err := iter.Err(); err != nil {
 		c.Logger.WithError(err).Warn("Failed to iterate IPv4 incomplete handshake counts")
@@ -687,9 +684,6 @@ func (c *Collector) enforceIncompleteHandshakeThresholdsIPv6(nowNS uint64) {
 				"last_updated_ns":            entry.LastUpdated,
 			}).Warn("Failed to block IPv6 IP for incomplete handshake flood")
 			continue
-		}
-		if err := c.purgePendingHandshakesForIPv6(ip); err != nil {
-			c.Logger.WithError(err).WithField("ip", ip.String()).Warn("Blocked IPv6 IP but failed to purge pending handshake state")
 		}
 	}
 	if err := iter.Err(); err != nil {
@@ -775,71 +769,6 @@ func (c *Collector) decrementIncompleteHandshakeCountIPv6(saddr [16]byte) error 
 		entry.LastUpdated = nowNS
 	}
 	return c.Maps.IncompleteHandshakeCountsV6.Put(saddr, entry)
-}
-
-func (c *Collector) purgePendingHandshakesForIPv4(ip net.IP) error {
-	if c.Maps == nil || c.Maps.PendingHandshakes == nil {
-		return nil
-	}
-	ip4 := ip.To4()
-	if ip4 == nil {
-		return nil
-	}
-	saddr := binary.LittleEndian.Uint32(ip4)
-	var key ebpf.TcpSessionKey
-	var val ebpf.HandshakeStatusGeneric
-	iter := c.Maps.PendingHandshakes.Iterate()
-	keysToDelete := make([]ebpf.TcpSessionKey, 0)
-	for iter.Next(&key, &val) {
-		if key.Saddr == saddr {
-			keysToDelete = append(keysToDelete, key)
-		}
-	}
-	if err := iter.Err(); err != nil {
-		return err
-	}
-	for _, k := range keysToDelete {
-		if err := c.Maps.PendingHandshakes.Delete(&k); err != nil {
-			return err
-		}
-	}
-	if c.Maps.IncompleteHandshakeCounts != nil {
-		_ = c.Maps.IncompleteHandshakeCounts.Delete(&saddr)
-	}
-	return nil
-}
-
-func (c *Collector) purgePendingHandshakesForIPv6(ip net.IP) error {
-	if c.Maps == nil || c.Maps.PendingHandshakesV6 == nil {
-		return nil
-	}
-	ip16 := ip.To16()
-	if ip16 == nil {
-		return nil
-	}
-	var saddr [16]byte
-	copy(saddr[:], ip16)
-	var key ebpf.TcpSessionKeyV6
-	var val ebpf.HandshakeStatusGeneric
-	iter := c.Maps.PendingHandshakesV6.Iterate()
-	keysToDelete := make([]ebpf.TcpSessionKeyV6, 0)
-	for iter.Next(&key, &val) {
-		if key.Saddr == saddr {
-			keysToDelete = append(keysToDelete, key)
-		}
-	}
-	if err := iter.Err(); err != nil {
-		return err
-	}
-	for _, k := range keysToDelete {
-		if err := c.Maps.PendingHandshakesV6.Delete(&k); err != nil {
-			return err
-		}
-	}
-	if c.Maps.IncompleteHandshakeCountsV6 != nil {
-		_ = c.Maps.IncompleteHandshakeCountsV6.Delete(&saddr)
-	}
-	return nil
 }
 
 func (c *Collector) refreshICMPRates() {
