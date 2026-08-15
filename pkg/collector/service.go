@@ -374,10 +374,15 @@ func (c *Collector) pollMaps() {
 			c.Logger.Debug("Polling eBPF maps for local maintenance")
 			c.syncIncidentDropCounters()
 			c.refreshPendingHandshakes()
-			c.refreshICMPRates()
-			c.refreshUDPRates()
-			c.refreshBadFlags()
-			c.pruneStaleState()
+
+			// until we have something to do userspace with these rates we dont need this iteration just to get metrics
+			// c.refreshICMPRates()
+			// c.refreshUDPRates()
+			// c.refreshBadFlags()
+
+			// no need to prune prev rates if we dont refresh them
+			// c.prunePreviousRates()
+			
 			if lastKernelStateGC.IsZero() || time.Since(lastKernelStateGC) >= kernelStateCleanupInterval {
 				c.cleanupStaleKernelState()
 				lastKernelStateGC = time.Now()
@@ -930,7 +935,7 @@ const (
 	kernelStateCleanupInterval               = 5 * time.Minute
 )
 
-func (c *Collector) pruneStaleState() {
+func (c *Collector) prunePreviousRates() {
 	maxClock := uint64(0)
 	for _, v := range c.prevICMPRates {
 		if v.lastTime > maxClock {
