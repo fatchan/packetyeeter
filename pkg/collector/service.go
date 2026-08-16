@@ -87,6 +87,14 @@ type Collector struct {
 	targetedDomainsMu  sync.RWMutex
 	incidentReader     *perf.Reader
 
+	// Cached blocked IP counts, periodically refreshed from kernel maps so
+	// Prometheus and /stats can reuse the same semi-accurate values without
+	// rescanning the maps on every HTTP request.
+	blockedIPCountsMu       sync.RWMutex
+	blockedIPsCurrentIPv4   int
+	blockedIPsCurrentIPv6   int
+	blockedIPsCurrentTotal  int
+
 	// Previous rates to compute pps across windows (monotonic timestamps)
 	prevICMPRates   map[uint32]prevRate
 	prevUDPRates    map[uint32]prevRate
@@ -582,28 +590,47 @@ func (c *Collector) syncIncidentDropCounters() {
 	}
 }
 
+func (c *Collector) setCachedBlockedIPCounts(ipv4Count, ipv6Count int) {
+	total := ipv4Count + ipv6Count
+	c.blockedIPCountsMu.Lock()
+	c.blockedIPsCurrentIPv4 = ipv4Count
+	c.blockedIPsCurrentIPv6 = ipv6Count
+	c.blockedIPsCurrentTotal = total
+	c.blockedIPCountsMu.Unlock()
+}
+
+func (c *Collector) getCachedBlockedIPTotal() int {
+	c.blockedIPCountsMu.RLock()
+	defer c.blockedIPCountsMu.RUnlock()
+	return c.blockedIPsCurrentTotal
+}
+
 func (c *Collector) syncBlockedIPCounts() {
 	if c.Maps == nil {
+		c.setCachedBlockedIPCounts(0, 0)
 		metrics.BlockedIPsCurrent.WithLabelValues("ipv4").Set(0)
 		metrics.BlockedIPsCurrent.WithLabelValues("ipv6").Set(0)
 		metrics.BlockedIPsCurrentTotal.Set(0)
 		return
 	}
 
-	ipv4Count, err := countMapEntriesUint32(c.Maps.BlockedIPs)
-	if err != nil {
+	ipv4Count := 0
+	if count, err := countMapEntriesUint32(c.Maps.BlockedIPs); err != nil {
 		c.Logger.WithError(err).Debug("Failed counting IPv4 blocked IP entries")
 	} else {
+		ipv4Count = count
 		metrics.BlockedIPsCurrent.WithLabelValues("ipv4").Set(float64(ipv4Count))
 	}
 
-	ipv6Count, err := countMapEntriesIPv6(c.Maps.BlockedIPsV6)
-	if err != nil {
+	ipv6Count := 0
+	if count, err := countMapEntriesIPv6(c.Maps.BlockedIPsV6); err != nil {
 		c.Logger.WithError(err).Debug("Failed counting IPv6 blocked IP entries")
 	} else {
+		ipv6Count = count
 		metrics.BlockedIPsCurrent.WithLabelValues("ipv6").Set(float64(ipv6Count))
 	}
 
+	c.setCachedBlockedIPCounts(ipv4Count, ipv6Count)
 	metrics.BlockedIPsCurrentTotal.Set(float64(ipv4Count + ipv6Count))
 }
 
@@ -1052,7 +1079,7 @@ const (
 	kernelStateExpiryBadFlags  time.Duration = 10 * time.Minute
 	kernelStateExpiryHandshake time.Duration = 30 * time.Second
 	kernelStateCleanupInterval               = 5 * time.Minute
-	blockedIPCountSyncInterval               = 30 * time.Second
+	blockedIPCountSyncInterval               = 60 * time.Second
 )
 
 func (c *Collector) prunePreviousRates() {
@@ -1180,12 +1207,12 @@ func (c *Collector) cleanupStaleKernelState() {
 			"pending_handshakes_v6":          removedHandshakesV6,
 			"incomplete_handshake_counts_v4": removedHandshakeCountsV4,
 			"incomplete_handshake_counts_v6": removedHandshakeCountsV6,
-			"rate_expiry":                    kernelStateExpiryRate,
-			"http3_seen_ttl":                 c.Config.HTTP3SeenTTL,
-			"bad_flags_expiry":               kernelStateExpiryBadFlags,
-			"handshake_expiry":               kernelStateExpiryHandshake,
-			"run_interval":                   kernelStateCleanupInterval,
-			"duration":                       duration,
+			// "rate_expiry":                    kernelStateExpiryRate,
+			// "http3_seen_ttl":                 c.Config.HTTP3SeenTTL,
+			// "bad_flags_expiry":               kernelStateExpiryBadFlags,
+			// "handshake_expiry":               kernelStateExpiryHandshake,
+			// "run_interval":                   kernelStateCleanupInterval,
+			// "duration":                       duration,
 			"duration_milliseconds":          duration.Milliseconds(),
 		}
 		if cleanupErr != "" {
@@ -1201,6 +1228,7 @@ func (c *Collector) cleanupStaleKernelState() {
 	}
 
 	nowNS, err := monotonicNowNS()
+	wallNowNS := uint64(time.Now().UnixNano())
 	if err != nil {
 		cleanupErr = fmt.Sprintf("failed to read monotonic clock for kernel state cleanup: %v", err)
 		c.Logger.WithError(err).Warn("Failed to read monotonic clock for kernel state cleanup")
@@ -1212,8 +1240,8 @@ func (c *Collector) cleanupStaleKernelState() {
 	removedICMPv6 = pruneKernelRateMapV6(c.Maps.ICMPRatesV6, staleKernelCutoff(nowNS, kernelStateExpiryRate), c.Logger, "icmp_rates_v6")
 	removedUDPv4 = pruneKernelRateMap(c.Maps.UDPRates, staleKernelCutoff(nowNS, kernelStateExpiryRate), c.Logger, "udp_rates")
 	removedUDPv6 = pruneKernelRateMapV6(c.Maps.UDPRatesV6, staleKernelCutoff(nowNS, kernelStateExpiryRate), c.Logger, "udp_rates_v6")
-	removedHTTP3SeenV4 = pruneKernelExpiryMap(c.Maps.HTTP3SeenIPs, nowNS, c.Logger, "http3_seen_ips")
-	removedHTTP3SeenV6 = pruneKernelExpiryMapV6(c.Maps.HTTP3SeenIPsV6, nowNS, c.Logger, "http3_seen_ips_v6")
+	removedHTTP3SeenV4 = pruneKernelExpiryMap(c.Maps.HTTP3SeenIPs, wallNowNS, c.Logger, "http3_seen_ips")
+	removedHTTP3SeenV6 = pruneKernelExpiryMapV6(c.Maps.HTTP3SeenIPsV6, wallNowNS, c.Logger, "http3_seen_ips_v6")
 	removedBadFlagsV4 = pruneKernelBadFlagsMap(c.Maps.BadFlags, staleKernelCutoff(nowNS, kernelStateExpiryBadFlags), c.Logger, "bad_flags")
 	removedBadFlagsV6 = pruneKernelBadFlagsMapV6(c.Maps.BadFlagsV6, staleKernelCutoff(nowNS, kernelStateExpiryBadFlags), c.Logger, "bad_flags_v6")
 	removedHandshakesV4 = pruneKernelPendingHandshakesMap(c.Maps.PendingHandshakes, handshakeCutoff, c.Logger, "pending_handshakes")
@@ -1544,23 +1572,9 @@ func (c *Collector) gcExpiredBlocks() {
 }
 
 func (c *Collector) buildJSONStatsResponse() CollectorJSONStatsResponse {
-	blockedTotal := 0
-	if c.Maps != nil {
-		if ipv4Count, err := countMapEntriesUint32(c.Maps.BlockedIPs); err == nil {
-			blockedTotal += ipv4Count
-		} else {
-			c.Logger.WithError(err).Debug("Failed counting IPv4 blocked IPs for JSON stats")
-		}
-		if ipv6Count, err := countMapEntriesIPv6(c.Maps.BlockedIPsV6); err == nil {
-			blockedTotal += ipv6Count
-		} else {
-			c.Logger.WithError(err).Debug("Failed counting IPv6 blocked IPs for JSON stats")
-		}
-	}
-
 	return CollectorJSONStatsResponse{
 		TargetedDomains: c.snapshotTargetedDomains(time.Now()),
-		BlockedIPsTotal: blockedTotal,
+		BlockedIPsTotal: c.getCachedBlockedIPTotal(),
 	}
 }
 
